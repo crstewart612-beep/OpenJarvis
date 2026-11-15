@@ -478,3 +478,38 @@ def test_no_step_breakdown_without_the_online_model(client):
     client.app.state.focus_local_steps = False
     task = client.post("/v1/focus/task", json={"title": "Send invoice"}).json()
     assert task["steps"] == ["Send invoice"]
+
+
+def test_speak_uses_the_chosen_calm_voice_and_caches(client):
+    class Tts:
+        backend_id = "kokoro"
+
+        def __init__(self):
+            self.calls = []
+
+        def synthesize(self, text, **kwargs):
+            self.calls.append((text, kwargs["voice_id"]))
+
+            class Result:
+                audio = b"RIFFdata"
+
+            return Result()
+
+    tts = Tts()
+    client.app.state.tts_resolved = True
+    client.app.state.tts_backend = tts
+
+    def speak(**body):
+        return client.post("/v1/focus/speak", json=body)
+
+    assert speak(text="Hello", mode="calm", voice="am_onyx").content == b"RIFFdata"
+    speak(text="Hello", mode="calm", voice="am_onyx")
+    speak(text="Hello", mode="calm", voice="not_a_voice")
+    speak(text="Now.", mode="deadline", voice="am_onyx")
+    speak(text="hola", mode="es", voice="am_onyx")
+    assert tts.calls == [
+        ("Hello", "am_onyx"),
+        ("Hello", "bm_george"),
+        ("Now.", "am_eric"),
+        ("hola", "em_alex"),
+    ]

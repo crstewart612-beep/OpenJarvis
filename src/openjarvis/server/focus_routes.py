@@ -121,6 +121,12 @@ class CommandBody(BaseModel):
 class SpeakBody(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     mode: str = "calm"
+    # Which calm voice to use; ignored for the deadline and Spanish voices.
+    voice: Optional[str] = None
+
+
+# Deep, calm male voices the person can choose between for everyday replies.
+CALM_VOICES = ("bm_george", "am_onyx", "am_michael", "bm_lewis", "am_fenrir")
 
 
 def _store(request: Request) -> FocusStore:
@@ -854,17 +860,34 @@ async def speak(request: Request, body: SpeakBody):
             status_code=501, detail="No text-to-speech backend available"
         )
     voice_id, speed = VOICE_MODES.get(body.mode, VOICE_MODES["calm"])
+    if body.mode == "calm" and body.voice in CALM_VOICES:
+        voice_id = body.voice
     if getattr(backend, "backend_id", "kokoro") != "kokoro":
         voice_id = ""
-    try:
-        result = await asyncio.to_thread(
-            backend.synthesize,
-            body.text.strip(),
-            voice_id=voice_id,
-            speed=speed,
-            output_format="wav",
-        )
-    except Exception as exc:
-        logger.exception("Focus speech failed")
-        raise HTTPException(status_code=500, detail="Speech synthesis failed") from exc
-    return Response(content=result.audio, media_type="audio/wav")
+    text = body.text.strip()
+    # Lines are often repeated ("Correct.", "What should I add?"), and making
+    # speech is the slow part, so keep what has already been generated.
+    cache = getattr(request.app.state, "focus_speech_cache", None)
+    if cache is None:
+        cache = request.app.state.focus_speech_cache = {}
+    key = (voice_id, speed, text)
+    audio = cache.get(key)
+    if audio is None:
+        try:
+            result = await asyncio.to_thread(
+                backend.synthesize,
+                text,
+                voice_id=voice_id,
+                speed=speed,
+                output_format="wav",
+            )
+        except Exception as exc:
+            logger.exception("Focus speech failed")
+            raise HTTPException(
+                status_code=500, detail="Speech synthesis failed"
+            ) from exc
+        audio = result.audio
+        if len(cache) >= 300:
+            cache.clear()
+        cache[key] = audio
+    return Response(content=audio, media_type="audio/wav")
