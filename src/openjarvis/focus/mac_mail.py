@@ -46,7 +46,7 @@ function run(argv) {
 def read_unread(limit: int = 8) -> Dict[str, Any]:
     """Unread counts per account and the newest few unread subjects."""
     try:
-        raw = _osascript(_UNREAD, str(limit), timeout=60.0)
+        raw = _osascript(_UNREAD, str(limit), timeout=180.0)
     except CalendarError as exc:
         raise MailError(str(exc).replace("Calendar", "Mail")) from exc
     data = json.loads(raw or "{}")

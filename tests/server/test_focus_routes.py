@@ -25,6 +25,18 @@ def _no_cloud_keys(monkeypatch):
     monkeypatch.setattr(cloud_router, "_load_keys", lambda: {})
 
 
+def _loaded(client, path):
+    """Poll a slow-read route until its background read has finished."""
+    import time
+
+    for _ in range(200):
+        out = client.get(path).json()
+        if not out.get("loading"):
+            return out
+        time.sleep(0.01)
+    raise AssertionError(f"{path} never finished loading")
+
+
 class _Heard:
     def __init__(self, text):
         self.text = text
@@ -620,7 +632,7 @@ def test_calendar_route_and_copying_dated_tasks(client, monkeypatch):
     )
     monkeypatch.setattr(mac_calendar, "calendars", lambda: ["Work", "Home"])
     monkeypatch.setattr(mac_calendar, "create_event", lambda *a: created.append(a))
-    out = client.get("/v1/focus/calendar").json()
+    out = _loaded(client, "/v1/focus/calendar")
     assert out["events"] == [{"title": "Standup"}] and out["calendars"] == [
         "Work",
         "Home",
@@ -647,14 +659,14 @@ def test_calendar_route_and_copying_dated_tasks(client, monkeypatch):
         ("Work", "B", "2026-11-20T15:00:00", False),
         ("Work", "C", "2026-11-21T00:00:00", True),
     ]
-    assert client.get("/v1/focus/calendar").json()["write_to"] == "Work"
+    assert _loaded(client, "/v1/focus/calendar")["write_to"] == "Work"
 
 
 def test_calendar_route_off_the_mac(client, monkeypatch):
     from openjarvis.focus import mac_calendar
 
     monkeypatch.setattr(mac_calendar, "available", lambda: False)
-    out = client.get("/v1/focus/calendar").json()
+    out = _loaded(client, "/v1/focus/calendar")
     assert out["available"] is False and out["events"] == []
 
 
@@ -688,7 +700,7 @@ def test_duplicate_calendar_events_are_shown_once(client, monkeypatch):
         lambda: {"events": events, "source": "database", "note": ""},
     )
     monkeypatch.setattr(mac_calendar, "calendars", lambda: [])
-    out = client.get("/v1/focus/calendar").json()
+    out = _loaded(client, "/v1/focus/calendar")
     assert [(e["calendar"], e["start"][:10]) for e in out["events"]] == [
         ("Gmail", "2026-11-20"),
         ("Yahoo", "2026-11-21"),
@@ -707,7 +719,7 @@ def test_mail_route_and_spoken_summary(client, monkeypatch):
     }
     monkeypatch.setattr(mac_mail, "available", lambda: True)
     monkeypatch.setattr(mac_mail, "read_unread", lambda: data)
-    assert client.get("/v1/focus/mail").json()["unread"] == 3
+    assert _loaded(client, "/v1/focus/mail")["unread"] == 3
     out = client.post(
         "/v1/focus/command", json={"text": "Morpheus, check my email"}
     ).json()
@@ -799,3 +811,31 @@ def test_business_suggestions_need_a_resume_and_are_saved(client, monkeypatch):
         "Message five contacts",
     ]
     assert client.get("/v1/focus/business").json() == out
+
+
+def test_slow_reads_do_not_block_and_report_errors(client, monkeypatch):
+    import threading
+
+    from openjarvis.focus import mac_calendar, mac_mail
+
+    gate = threading.Event()
+
+    def slow():
+        gate.wait(5)
+        return {"unread": 2, "accounts": [], "latest": []}
+
+    def denied():
+        raise mac_calendar.CalendarError(
+            "macOS has not allowed access to Calendar yet."
+        )
+
+    monkeypatch.setattr(mac_mail, "available", lambda: True)
+    monkeypatch.setattr(mac_mail, "read_unread", slow)
+    first = client.get("/v1/focus/mail").json()
+    assert first["loading"] is True and first["unread"] == 0
+    gate.set()
+    assert _loaded(client, "/v1/focus/mail")["unread"] == 2
+    monkeypatch.setattr(mac_calendar, "available", lambda: True)
+    monkeypatch.setattr(mac_calendar, "read_events", denied)
+    out = _loaded(client, "/v1/focus/calendar")
+    assert "not allowed" in out["error"] and out["events"] == []

@@ -132,7 +132,9 @@ def read_events(days: int = 7, now: datetime | None = None) -> Dict[str, Any]:
     except Exception:
         start = now - timedelta(minutes=1)
         end = now + timedelta(days=days)
-        raw = _osascript(_READ_EVENTS, start.isoformat(), end.isoformat(), timeout=60.0)
+        raw = _osascript(
+            _READ_EVENTS, start.isoformat(), end.isoformat(), timeout=180.0
+        )
         events, source = list(json.loads(raw or "[]")), "calendar-app"
         note = (
             "Repeating events may be missing. Giving Terminal Full Disk Access "

@@ -374,13 +374,52 @@ def _copy_to_calendar(request: Request, title: str, due: Optional[str]) -> None:
             await asyncio.to_thread(
                 mac_calendar.create_event, target, title, when, 30, all_day
             )
-            request.app.state.focus_calendar_cache = None
+            slot = getattr(request.app.state, "focus_calendar_slot", None)
+            if slot:
+                slot["at"] = 0.0  # show the new event on the next read
             request.app.state.focus_calendar_error = ""
         except Exception as exc:
             logger.warning("Could not add %r to the calendar: %s", title, exc)
             request.app.state.focus_calendar_error = str(exc)
 
     _background(request, _add())
+
+
+def _slow_read(request: Request, name: str, loader, ttl: float) -> dict:
+    """Latest result of a slow read, refreshed in the background.
+
+    The Mac's Calendar and Mail can take a minute to answer the first time,
+    so a request never waits for them: it gets what is known so far and a
+    ``loading`` flag, and the read carries on behind it.
+    """
+    state = request.app.state
+    slot = getattr(state, f"focus_{name}_slot", None)
+    if slot is None:
+        slot = {"at": 0.0, "data": None, "error": "", "task": None}
+        setattr(state, f"focus_{name}_slot", slot)
+    age = time.monotonic() - slot["at"]
+    stale = slot["at"] == 0.0 or age > (ttl if not slot["error"] else 60)
+    running = slot["task"] is not None and not slot["task"].done()
+    if stale and not running:
+
+        async def _run() -> None:
+            try:
+                slot["data"] = await asyncio.to_thread(loader)
+                slot["error"] = ""
+            except mac_calendar.CalendarError as exc:
+                slot["error"] = str(exc)
+            except Exception:
+                logger.exception("Reading %s failed", name)
+                slot["error"] = f"The {name} could not be read."
+            slot["at"] = time.monotonic()
+
+        slot["task"] = asyncio.create_task(_run())
+        running = True
+    return {
+        "data": slot["data"],
+        "error": slot["error"],
+        "loading": running and slot["data"] is None and not slot["error"],
+    }
 
 
 def _unique_events(events: list) -> list:
@@ -400,28 +439,29 @@ def _unique_events(events: list) -> list:
 @focus_router.get("/mail")
 async def unread_mail(request: Request):
     """Unread mail from the Mac's Mail app. Subjects are not written to disk."""
-    state = request.app.state
     out = {"available": mac_mail.available(), "unread": 0, "accounts": [], "latest": []}
-    out["error"] = ""
+    out.update(error="", loading=False)
     if not out["available"]:
         return out
-    cached = getattr(state, "focus_mail_cache", None)
-    if cached and time.monotonic() - cached[0] < 300:
-        return {**out, **cached[1]}
-    try:
-        data = await asyncio.to_thread(mac_mail.read_unread)
-    except mac_mail.MailError as exc:
-        return {**out, "error": str(exc)}
-    except Exception:
-        logger.exception("Mail read failed")
-        return {**out, "error": "Mail could not be read."}
-    state.focus_mail_cache = (time.monotonic(), data)
-    return {**out, **data}
+    got = _slow_read(request, "mail", mac_mail.read_unread, 300)
+    return {
+        **out,
+        **(got["data"] or {}),
+        "error": got["error"],
+        "loading": got["loading"],
+    }
+
+
+def _load_calendar() -> dict:
+    data = mac_calendar.read_events()
+    data["events"] = _unique_events(data["events"])
+    data["calendars"] = mac_calendar.calendars()
+    return data
 
 
 @focus_router.get("/calendar")
 async def calendar_events(request: Request):
-    """Upcoming events from the Mac's Calendar app, cached for two minutes."""
+    """Upcoming events from the Mac's Calendar app, refreshed every two minutes."""
     state = request.app.state
     write_to = (_store(request).section("calendar") or {}).get("write_to", "")
     out = {
@@ -432,23 +472,17 @@ async def calendar_events(request: Request):
         "source": "none",
         "note": "",
         "error": getattr(state, "focus_calendar_error", ""),
+        "loading": False,
     }
     if not out["available"]:
         return out
-    cached = getattr(state, "focus_calendar_cache", None)
-    if cached and time.monotonic() - cached[0] < 120:
-        return {**out, **cached[1]}
-    try:
-        data = await asyncio.to_thread(mac_calendar.read_events)
-        data["events"] = _unique_events(data["events"])
-        data["calendars"] = await asyncio.to_thread(mac_calendar.calendars)
-    except mac_calendar.CalendarError as exc:
-        return {**out, "error": str(exc)}
-    except Exception:
-        logger.exception("Calendar read failed")
-        return {**out, "error": "The calendar could not be read."}
-    state.focus_calendar_cache = (time.monotonic(), data)
-    return {**out, **data}
+    got = _slow_read(request, "calendar", _load_calendar, 120)
+    return {
+        **out,
+        **(got["data"] or {}),
+        "error": got["error"] or out["error"],
+        "loading": got["loading"],
+    }
 
 
 @focus_router.put("/calendar")
@@ -1229,8 +1263,15 @@ def _add_spoken_task(request: Request, plan: dict) -> str:
 
 async def _mail_summary(request: Request) -> str:
     data = await unread_mail(request)
+    for _ in range(40):
+        if not data["loading"]:
+            break
+        await asyncio.sleep(0.5)
+        data = await unread_mail(request)
     if not data["available"]:
         return "I can only read mail on your Mac."
+    if data["loading"]:
+        return "Your mail is still loading. Ask me again in a minute."
     if data["error"]:
         return "I could not read your mail. " + data["error"]
     if not data["unread"]:

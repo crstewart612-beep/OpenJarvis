@@ -40,12 +40,12 @@ interface SpanishProgress {
 }
 interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface CalEvent { title: string; start: string; all_day: boolean; calendar: string }
-interface CalState { available: boolean; events: CalEvent[]; calendars: string[]; write_to: string; source: string; note: string; error: string }
-interface MailState { available: boolean; unread: number; accounts: { name: string; unread: number }[]; latest: { from: string; subject: string; date: string; account: string }[]; error: string }
+interface CalState { loading?: boolean; available: boolean; events: CalEvent[]; calendars: string[]; write_to: string; source: string; note: string; error: string }
+interface MailState { loading?: boolean; available: boolean; unread: number; accounts: { name: string; unread: number }[]; latest: { from: string; subject: string; date: string; account: string }[]; error: string }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 25';
+const BUILD = 'build 26';
 // What the assistant is called on screen and out loud.
 const NAME = 'Morpheus';
 const NAV: [string, string][] = [
@@ -330,6 +330,16 @@ function audioForm(rec: Recording, fields: Record<string, string> = {}): FormDat
   return form;
 }
 
+/** Plain words for a microphone failure. */
+function micMessage(err: unknown, fallback: string): string {
+  const name = err instanceof Error ? err.name : '';
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return 'Safari blocked the microphone. Click the Ready card to try again and choose Allow.';
+  }
+  if (name === 'NotFoundError') return 'No microphone was found on this Mac.';
+  return err instanceof Error && err.message ? err.message : fallback;
+}
+
 async function errorDetail(res: Response | null, fallback: string): Promise<string> {
   if (!res) return 'The server did not answer.';
   const body = await res.json().catch(() => ({}));
@@ -426,12 +436,10 @@ export function FocusPage() {
       setOffline(false);
       const sp = await send('/v1/focus/spanish', 'GET');
       if (sp.ok) setLesson(await sp.json());
-      const cl = await send('/v1/focus/calendar', 'GET');
-      if (cl.ok) setCal(await cl.json());
-      const ml = await send('/v1/focus/mail', 'GET');
-      if (ml.ok) setMail(await ml.json());
-      const bz = await send('/v1/focus/business', 'GET');
-      if (bz.ok) setPlans((await bz.json()).plans ?? []);
+      // These three are independent and may be slow; none may hold up the rest.
+      void send('/v1/focus/calendar', 'GET').then(async (r) => { if (r.ok) setCal(await r.json()); }).catch(() => {});
+      void send('/v1/focus/mail', 'GET').then(async (r) => { if (r.ok) setMail(await r.json()); }).catch(() => {});
+      void send('/v1/focus/business', 'GET').then(async (r) => { if (r.ok) setPlans((await r.json()).plans ?? []); }).catch(() => {});
     } catch {
       setOffline(true);
     }
@@ -709,7 +717,7 @@ export function FocusPage() {
         await speak(data.es, 'es');
       }
     } catch (err) {
-      setFeedback({ ok: false, text: err instanceof Error ? err.message : 'The microphone is not available.' });
+      setFeedback({ ok: false, text: micMessage(err, 'The microphone is not available.') });
     } finally {
       closeMic();
       busyRef.current = false;
@@ -758,7 +766,7 @@ export function FocusPage() {
       }
       setTalkStatus('');
     } catch (err) {
-      setTalkStatus(abort.signal.aborted ? '' : err instanceof Error ? err.message : 'The conversation stopped.');
+      setTalkStatus(abort.signal.aborted ? '' : micMessage(err, 'The conversation stopped.'));
     } finally {
       talkRef.current = false;
       setTalking(false);
@@ -865,7 +873,7 @@ export function FocusPage() {
         }
       }
     } catch (err) {
-      setTalkStatus(abort.signal.aborted ? '' : err instanceof Error ? err.message : 'The lesson stopped.');
+      setTalkStatus(abort.signal.aborted ? '' : micMessage(err, 'The lesson stopped.'));
     } finally {
       talkRef.current = false;
       setTalking(false);
@@ -936,7 +944,7 @@ export function FocusPage() {
       }
       setWakeStatus('');
     } catch (err) {
-      setWakeStatus(err instanceof Error ? err.message : 'Listening stopped.');
+      setWakeStatus(micMessage(err, 'Listening stopped.'));
     } finally {
       wakeRef.current = false;
       setWake(false);
@@ -1615,12 +1623,14 @@ export function FocusPage() {
               ))}
             </ul>
           ) : <p className="note">Nothing coming up. Say “Hey {NAME}, add … for Friday at 3”.</p>}
-          <p className="note foot">{cal?.error ? cal.error : cal?.available ? (cal.write_to ? `New dated tasks also go to “${cal.write_to}”.` : 'Showing your Mac calendars.') : 'Mac calendars are not connected.'}</p>
+          <p className="note foot">{!cal || cal.loading ? 'Loading your Mac calendars. The first time can take a minute or two…' : cal.error ? cal.error : cal.available ? (cal.write_to ? `New dated tasks also go to “${cal.write_to}”.` : 'Showing your Mac calendars.') : 'Calendars can only be read on a Mac.'}</p>
         </section>
 
         <section className="card">
           <h2><Mail size={20} /> Email {mail && mail.unread > 0 && <span className="badge">{mail.unread}</span>}</h2>
-          {!mail?.available ? (
+          {!mail || mail.loading ? (
+            <p className="note">Loading your mail. The first time can take a minute or two…</p>
+          ) : !mail.available ? (
             <p className="note">Mail can only be read on a Mac.</p>
           ) : mail.error ? (
             <p className="note late">{mail.error}</p>
@@ -1862,7 +1872,9 @@ export function FocusPage() {
               <div className="span4">
                 <div className="panel">
                   <h2>Mac calendars</h2>
-                  {!cal?.available ? (
+                  {!cal || cal.loading ? (
+                    <p className="note">Loading your Mac calendars. The first time can take a minute or two…</p>
+                  ) : !cal.available ? (
                     <p className="note">Calendars can only be read on a Mac.</p>
                   ) : (
                     <>
@@ -1894,7 +1906,7 @@ export function FocusPage() {
             <div className="grid12"><div className="span8">
               <div className="panel">
                 <h2>Email <span>{mail?.available && !mail.error ? `${mail.unread} unread` : ''}</span></h2>
-                {!mail?.available ? <p className="note">Mail can only be read on a Mac.</p> : mail.error ? <p className="fb bad" style={{ textAlign: 'left' }}>{mail.error}</p> : (
+                {!mail || mail.loading ? <p className="note">Loading your mail…</p> : !mail.available ? <p className="note">Mail can only be read on a Mac.</p> : mail.error ? <p className="fb bad" style={{ textAlign: 'left' }}>{mail.error}</p> : (
                   <>
                     {mail.accounts.map((a) => <div className="kv" key={a.name}><span>{a.name}</span><span>{a.unread} unread</span></div>)}
                     <ul style={{ marginTop: 10 }}>
