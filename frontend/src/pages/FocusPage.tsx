@@ -14,10 +14,13 @@ interface FocusTask {
 }
 interface FocusCapture { id: string; text: string; at: string }
 interface FocusSignal { id: string; symbol: string; action: 'long' | 'short' | 'exit' | 'wait'; say: string; at: string }
+interface FocusJob { id: string; title: string; company: string; url: string; salary: string; status: 'found' | 'drafted' | 'submitted' | 'skipped'; draft: string }
 interface FocusState {
   tasks: FocusTask[];
   captures: FocusCapture[];
   signals: FocusSignal[];
+  jobs: FocusJob[];
+  job_profile: { titles: string[]; min_salary: number; has_resume: boolean };
   current: FocusTask | null;
   mode: 'calm' | 'deadline';
   risk_per_trade: number;
@@ -253,6 +256,35 @@ export function FocusPage() {
     await refresh();
   };
 
+  const draftJob = async (job: FocusJob) => {
+    setSay(`Writing a cover note for ${job.title}…`);
+    const res = await send(`/v1/focus/jobs/${job.id}/draft`, 'POST').catch(() => null);
+    if (!res?.ok) {
+      const detail = res ? (await res.json().catch(() => ({}))).detail : '';
+      setSay(detail || 'I could not write that draft.');
+      return;
+    }
+    setSay('Draft ready. Read it, then open the posting and submit.');
+    await refresh();
+  };
+
+  const jobStatus = async (job: FocusJob, status: FocusJob['status']) => {
+    await send(`/v1/focus/jobs/${job.id}/status`, 'POST', { status }).catch(() => null);
+    await refresh();
+  };
+
+  const copyDraft = async (job: FocusJob) => {
+    try {
+      await navigator.clipboard.writeText(job.draft);
+      setSay('Copied. Paste it into the application.');
+    } catch {
+      setSay('Copy failed. Select the text and copy it by hand.');
+    }
+  };
+
+  const openJobs = state?.jobs.filter((j) => j.status === 'found' || j.status === 'drafted') ?? [];
+  const sentJobs = state?.jobs.filter((j) => j.status === 'submitted').length ?? 0;
+
   const toggleSprint = () => {
     if (!running && left === 0) setLeft(SPRINT_SECONDS);
     if (!running) setSay('Sprint started. Just this one step.');
@@ -385,8 +417,29 @@ export function FocusPage() {
               )}
             </div>
             <div className="panel">
-              <h2>Job hunt</h2>
-              <p className="note" style={{ margin: 0 }}>Not connected yet</p>
+              <h2>Job hunt <span>{openJobs.length} to do · {sentJobs} sent</span></h2>
+              {openJobs.length ? (
+                <ul>
+                  {openJobs.map((j) => (
+                    <li key={j.id} style={{ flexDirection: 'column', gap: 6 }}>
+                      <span>{j.title}{j.company ? ` · ${j.company}` : ''}{j.salary ? ` · ${j.salary}` : ''}</span>
+                      {j.draft && <span className="draft">{j.draft}</span>}
+                      <span className="end" style={{ flexWrap: 'wrap' }}>
+                        <button className="small" onClick={() => void draftJob(j)}>{j.draft ? 'Redraft' : 'Draft'}</button>
+                        {j.draft && <button className="small" onClick={() => void copyDraft(j)}>Copy</button>}
+                        <a className="btn small" href={j.url} target="_blank" rel="noreferrer noopener">Open</a>
+                        <button className="small" onClick={() => void jobStatus(j, 'submitted')}>Sent</button>
+                        <button className="small" onClick={() => void jobStatus(j, 'skipped')}>Skip</button>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="note" style={{ margin: 0 }}>No jobs waiting. Automatic job search is not connected yet.</p>
+              )}
+              {state && !state.job_profile.has_resume && (
+                <p className="note" style={{ margin: '8px 0 0' }}>Resume not loaded yet, so drafts are off.</p>
+              )}
             </div>
             <div className="panel">
               <h2>Inbox</h2>

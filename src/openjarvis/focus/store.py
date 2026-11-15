@@ -41,6 +41,8 @@ class FocusStore:
         data.setdefault("tasks", [])
         data.setdefault("captures", [])
         data.setdefault("signals", [])
+        data.setdefault("jobs", [])
+        data.setdefault("job_profile", {"titles": [], "min_salary": 0, "resume": ""})
         data.setdefault("risk_per_trade", DEFAULT_RISK_PER_TRADE)
         return data
 
@@ -57,6 +59,8 @@ class FocusStore:
             data = self._load()
         for task in data["tasks"]:
             task["overdue"] = _is_overdue(task, now)
+        profile = data["job_profile"]
+        profile["has_resume"] = bool(profile.pop("resume", ""))
         open_tasks = [t for t in data["tasks"] if not t["done"]]
         open_tasks.sort(key=lambda t: (not t["overdue"], t.get("due") or "9999"))
         data["current"] = open_tasks[0] if open_tasks else None
@@ -116,6 +120,47 @@ class FocusStore:
             data["signals"] = [item] + rest
             self._save(data)
         return item
+
+    def job_profile(self) -> Dict[str, Any]:
+        with self._lock:
+            return self._load()["job_profile"]
+
+    def set_job_profile(self, **fields: Any) -> Dict[str, Any]:
+        with self._lock:
+            data = self._load()
+            given = {k: v for k, v in fields.items() if v is not None}
+            data["job_profile"].update(given)
+            self._save(data)
+            return data["job_profile"]
+
+    def add_job(self, job: Dict[str, Any]) -> Dict[str, Any]:
+        """Queue a job. A job already queued under the same link is returned as is."""
+        with self._lock:
+            data = self._load()
+            for existing in data["jobs"]:
+                if existing["url"] == job["url"]:
+                    return existing
+            item = {**job, "id": _new_id(), "status": "found", "draft": ""}
+            data["jobs"].insert(0, item)
+            self._save(data)
+        return item
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            for job in self._load()["jobs"]:
+                if job["id"] == job_id:
+                    return job
+        return None
+
+    def update_job(self, job_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            data = self._load()
+            for job in data["jobs"]:
+                if job["id"] == job_id:
+                    job.update(fields)
+                    self._save(data)
+                    return job
+        return None
 
     def remove_capture(self, capture_id: str) -> bool:
         return self._remove("captures", capture_id)

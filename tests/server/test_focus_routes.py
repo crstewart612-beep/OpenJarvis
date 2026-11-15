@@ -92,3 +92,46 @@ def test_chart_alert_validation_and_token(client, monkeypatch):
     assert client.post("/v1/focus/alert", json=ok).status_code == 403
     ok["token"] = "s3cret"
     assert client.post("/v1/focus/alert", json=ok).status_code == 200
+
+
+def test_job_queue_draft_and_submit(client):
+    job = client.post(
+        "/v1/focus/jobs",
+        json={
+            "title": "Process Improvement Manager",
+            "company": "Acme",
+            "url": "https://example.com/job/1",
+            "salary": "$90k",
+        },
+    ).json()
+    assert job["status"] == "found"
+    again = client.post(
+        "/v1/focus/jobs", json={"title": "Dup", "url": "https://example.com/job/1"}
+    ).json()
+    assert again["id"] == job["id"]
+    assert client.post(f"/v1/focus/jobs/{job['id']}/draft").status_code == 409
+    prof = client.put(
+        "/v1/focus/jobs/profile",
+        json={"titles": ["Change Management"], "min_salary": 65000, "resume": "CV"},
+    ).json()
+    assert prof == {
+        "titles": ["Change Management"],
+        "min_salary": 65000,
+        "has_resume": True,
+    }
+    drafted = client.post(f"/v1/focus/jobs/{job['id']}/draft").json()
+    assert drafted["status"] == "drafted" and drafted["draft"]
+    state = client.get("/v1/focus/state").json()
+    assert "resume" not in state["job_profile"]
+    assert state["job_profile"]["has_resume"] is True
+    sent = client.post(
+        f"/v1/focus/jobs/{job['id']}/status", json={"status": "submitted"}
+    ).json()
+    assert sent["status"] == "submitted"
+    bad = client.post(f"/v1/focus/jobs/{job['id']}/status", json={"status": "x"})
+    assert bad.status_code == 422
+
+
+def test_job_link_must_be_http(client):
+    r = client.post("/v1/focus/jobs", json={"title": "T", "url": "javascript:alert(1)"})
+    assert r.status_code == 422
