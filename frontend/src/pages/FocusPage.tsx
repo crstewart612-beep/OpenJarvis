@@ -339,7 +339,7 @@ export function FocusPage() {
               <h2>Trade sizing <span>you place every trade</span></h2>
               <div className="kv">
                 <span>Most you can lose per trade ($)</span>
-                <input id="focus-risk" type="number" min="1" step="1" key={state?.risk_per_trade} defaultValue={state?.risk_per_trade ?? 5}
+                <input id="focus-risk" type="number" min="1" step="1" key={state?.risk_per_trade} defaultValue={state?.risk_per_trade ?? 20}
                   onBlur={(e) => void setRisk(e.target.value)} aria-label="Risk per trade in dollars" />
               </div>
               <ul style={{ marginTop: 8 }}>

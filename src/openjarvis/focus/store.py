@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-DEFAULT_RISK_PER_TRADE = 5.0
+DEFAULT_RISK_PER_TRADE = 20.0
 
 
 def default_path() -> Path:

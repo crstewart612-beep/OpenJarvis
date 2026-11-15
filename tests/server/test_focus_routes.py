@@ -62,9 +62,9 @@ def test_capture_add_and_remove(client):
 
 def test_sizing_uses_risk_limit(client):
     data = client.get("/v1/focus/sizing").json()
-    assert data["risk_per_trade"] == 5
+    assert data["risk_per_trade"] == 20
     stops = {c["symbol"]: c["max_stop_points"] for c in data["contracts"]}
-    assert stops == {"MES": 1.0, "MNQ": 2.5, "MYM": 10, "M2K": 1.0}
+    assert stops == {"MES": 4.0, "MNQ": 10.0, "MYM": 40, "M2K": 4.0}
     client.put("/v1/focus/risk", json={"risk_per_trade": 25})
     mes = client.get("/v1/focus/sizing").json()["contracts"][0]
     assert mes["max_stop_points"] == 5.0
