@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -416,25 +417,71 @@ async def _read_audio(request: Request) -> tuple:
     return audio, ext
 
 
+def _steered_transcribe(
+    backend, audio: bytes, ext: str, language: Optional[str], hint: str
+) -> str:
+    """Transcribe with settings suited to short phrases.
+
+    Uses the Whisper model directly so a vocabulary hint can steer it and
+    silence can be dropped. Any backend without that model, or any failure
+    on this path, falls back to the backend's plain ``transcribe``.
+    """
+    ensure = getattr(backend, "_ensure_model", None)
+    if ensure is not None:
+        path = ""
+        try:
+            model = ensure()
+            with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+                tmp.write(audio)
+                path = tmp.name
+            options = {"beam_size": 5, "condition_on_previous_text": False}
+            if language:
+                options["language"] = language
+            if hint:
+                options["initial_prompt"] = hint
+            try:
+                segments, _info = model.transcribe(path, vad_filter=True, **options)
+                segments = list(segments)
+            except Exception:
+                logger.debug("Voice filter unavailable; transcribing without it")
+                segments, _info = model.transcribe(path, **options)
+                segments = list(segments)
+            kept = [s.text for s in segments if getattr(s, "no_speech_prob", 0) < 0.8]
+            return "".join(kept).strip()
+        except Exception:
+            logger.exception("Steered transcription failed; using the plain path")
+        finally:
+            if path:
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+    result = backend.transcribe(audio, format=ext, language=language)
+    return (result.text or "").strip()
+
+
 async def _run_stt(
-    request: Request, audio: bytes, ext: str, language: Optional[str]
+    request: Request,
+    audio: bytes,
+    ext: str,
+    language: Optional[str],
+    hint: str = "",
 ) -> str:
     try:
         backend = _stt(request)
-        result = await asyncio.to_thread(
-            backend.transcribe, audio, format=ext, language=language
+        return await asyncio.to_thread(
+            _steered_transcribe, backend, audio, ext, language, hint
         )
     except Exception as exc:
         logger.exception("Focus transcription failed")
         raise HTTPException(
             status_code=503, detail="Speech recognition is not available"
         ) from exc
-    return (result.text or "").strip()
 
 
-async def _transcribe(request: Request, language: Optional[str]) -> str:
+async def _transcribe(request: Request, language: Optional[str], hint: str = "") -> str:
     audio, ext = await _read_audio(request)
-    return await _run_stt(request, audio, ext, language)
+    return await _run_stt(request, audio, ext, language, hint)
 
 
 @focus_router.post("/listen/warm")
@@ -462,13 +509,22 @@ async def warm_listening(request: Request):
     return {"ready": False}
 
 
+# Steers speech recognition toward the words commands are made of.
+_COMMAND_HINT = (
+    "Hey Jarvis, add this to my to-do list. Hey Jarvis, remind me tomorrow. "
+    "Hey Jarvis, add it to my brain dump. Hey Jarvis, teach me Spanish."
+)
+_LESSON_COMMAND_HINT = "Hey Jarvis. Skip. Stop. Say it again. I know this."
+
+
 @focus_router.post("/listen")
 async def listen(request: Request):
     """Turn a short recording into text. The audio is not kept."""
     form = await request.form()
     language = form.get("language")
     language = language if isinstance(language, str) and language else None
-    return {"text": await _transcribe(request, language)}
+    hint = _COMMAND_HINT if language == "en" else ""
+    return {"text": await _transcribe(request, language, hint)}
 
 
 @focus_router.post("/spanish/say")
@@ -478,7 +534,8 @@ async def spanish_say(request: Request):
     item_id = form.get("item_id")
     if not isinstance(item_id, str) or item_id not in spanish._ITEMS:
         raise HTTPException(status_code=400, detail="Unknown item")
-    heard = await _transcribe(request, "es")
+    hint = ", ".join(spanish.unit_vocabulary(item_id))
+    heard = await _transcribe(request, "es", hint)
     state = _spanish_state(request)
     correct = spanish.heard_matches(item_id, heard)
     if correct:
@@ -511,30 +568,24 @@ async def spanish_voice(request: Request):
         raise HTTPException(status_code=400, detail="Unknown card kind")
     final = form.get("final") == "1"
     audio, ext = await _read_audio(request)
-    language = "en" if kind == "choose" else "es"
-    heard = await _run_stt(request, audio, ext, language)
     item = spanish._ITEMS[item_id]
-    correct = spanish.check_voice(item_id, kind, heard)
+    hint = ", ".join(spanish.unit_vocabulary(item_id))
+    heard = await _run_stt(request, audio, ext, "es", hint)
+    correct = spanish.check_voice(item_id, heard)
     command = None
     wake_text = ""
     if not correct:
-        english = heard if language == "en" else ""
         command = spanish.spoken_command(heard)
-        if command is None and commands.extract_command(english) is None:
-            # Listen to the same recording in the other language: English said
-            # during a Spanish answer ("skip", "hey Jarvis...") is garbled by
-            # Spanish recognition, and the reverse.
-            other = await _run_stt(
-                request, audio, ext, "en" if language == "es" else "es"
-            )
-            if language == "es":
-                english = other
-                command = spanish.spoken_command(other)
-            elif spanish.close_enough(item["es"], other):
-                # Asked for the meaning, the learner read the Spanish aloud.
-                command = "said_spanish"
-        if commands.extract_command(english) is not None:
-            command, wake_text = "wake", english
+        if command is None:
+            # English said during a Spanish answer ("skip", "hey Jarvis...")
+            # is garbled by Spanish recognition, so listen again in English.
+            english = await _run_stt(request, audio, ext, "en", _LESSON_COMMAND_HINT)
+            command = spanish.spoken_command(english)
+            if commands.extract_command(english) is not None:
+                command, wake_text = "wake", english
+        if command is None and (not heard or spanish.is_ghost(heard)):
+            # Nothing usable was heard; do not count it as an attempt.
+            command = "unclear"
     state = _spanish_state(request)
     if command == "skip":
         spanish.answer(state, item_id, "skip")

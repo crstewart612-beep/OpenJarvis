@@ -223,7 +223,8 @@ def _task(body: str, now: datetime) -> Dict[str, Any]:
 
 
 _LIST = r"(?:my |the |our )?"
-_ADD = r"(?:please )?(?:can you |could you )?(?:add|put|save|schedule|set)\s+"
+_ADD_VERB = r"(?:please )?(?:can you |could you )?(?:add|put|save|schedule|set)"
+_ADD = _ADD_VERB + r"\s+"
 
 
 def interpret_pending(
@@ -319,6 +320,10 @@ def interpret(text: str, now: Optional[datetime] = None) -> Dict[str, Any]:
         + _LIST
         + r"(?:calendar|to-?\s?do(?:s| list)?|task list|tasks?|list|schedule)\b"
     )
+    # "add to my to-do list: pick up the laundry tomorrow"
+    m = re.search("^" + _ADD_VERB + place + r"[\s:]*(.*)$", t)
+    if m:
+        return _task(re.sub(r"^(?:to|that)\s+", "", m.group(1)), now)
     m = re.search("^" + _ADD + r"(.+?)" + place + r"(.*)$", t)
     if m:
         return _task(f"{m.group(1)} {m.group(2)}", now)

@@ -37,7 +37,7 @@ interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 16';
+const BUILD = 'build 17';
 const SPRINT_SECONDS = 15 * 60;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CALM_LINE = "Take a breath. One thing at a time. I'm right here with you.";
@@ -642,15 +642,16 @@ export function FocusPage() {
         if (!card) { await tell('You have mastered every unit. Well done.'); break; }
         const prompt = async () => {
           setTalkStatus('Speaking…');
-          if (card.kind === 'type') { await tell(`How do you say, ${card.en}?`); return; }
+          // Every card is answered by saying the Spanish out loud.
+          if (card.kind !== 'intro') { await tell(`How do you say, ${card.en}?`); return; }
           await tell(card.es, 'es');
-          await tell(card.kind === 'intro' ? `That means ${card.en}. Now you say it.` : 'What does that mean?');
+          await tell(`That means ${card.en}. Now you say it.`);
         };
         await prompt();
         let attempts = 0;
         let next: SpanishLesson | null = null;
         while (talkRef.current && !next) {
-          setTalkStatus(card.kind === 'choose' ? 'Listening… say what it means, in English.' : 'Listening… say it in Spanish.');
+          setTalkStatus(`Listening… say it in Spanish: ${card.en}`);
           chime();
           const rec = await recordUtterance({ waitMs: 9000, silenceMs: 900, maxMs: 10000, cancelled });
           if (!talkRef.current) break;
@@ -678,10 +679,10 @@ export function FocusPage() {
           push({ role: 'you', text: data.heard || '(nothing clear)' });
           if (data.command === 'stop') { talkRef.current = false; break; }
           if (data.command === 'wake') { talkRef.current = false; handOff = data.wake_text; break; }
-          if (data.command === 'said_spanish') {
+          if (data.command === 'unclear') {
             attempts -= 1;
-            setFeedback({ ok: false, text: 'That is the Spanish. Say what it means, in English.' });
-            await tell('That is the Spanish. What does it mean, in English?');
+            setFeedback({ ok: false, text: 'I did not catch that. Say it again, a little louder.' });
+            await tell('I did not catch that. Say it again.');
             continue;
           }
           if (data.command === 'repeat') { attempts -= 1; await prompt(); continue; }
@@ -693,12 +694,12 @@ export function FocusPage() {
             next = after;
           } else if (attempts < 2) {
             setFeedback({ ok: false, text: `I heard "${data.heard || 'nothing clear'}". One more try.` });
-            await tell('Not quite. Try once more.');
-            if (card.kind !== 'choose') await tell(card.es, 'es');
+            await tell('Not quite. Listen, then try once more.');
+            await tell(card.es, 'es');
           } else {
             setFeedback({ ok: false, text: `Not yet: ${card.es} = ${card.en}` });
-            if (card.kind === 'choose') await tell(`It means ${card.en}.`);
-            else { await tell('It is,'); await tell(card.es, 'es'); }
+            await tell('It is,');
+            await tell(card.es, 'es');
             next = after;
           }
         }

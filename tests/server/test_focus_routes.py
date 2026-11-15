@@ -381,40 +381,78 @@ def test_voice_lesson_gives_a_second_try(client):
         client.app.state.focus_stt = _Stt(heard)
         return client.post("/v1/focus/spanish/voice", files=files, data=data).json()
 
+    def streak(item):
+        state = client.app.state.focus_store.section("spanish")
+        return state["items"][item]["streak"]
+
     ok = answer("Hola.", item_id="greetings:0", kind="intro")
     assert ok["correct"] is True and ok["command"] is None
-    miss = answer("goodbye", item_id="greetings:0", kind="choose")
-    assert miss["correct"] is False
-    assert client.app.state.focus_stt.calls[0][2] == "en"
-    state = client.app.state.focus_store.section("spanish")
-    assert state["items"]["greetings:0"]["streak"] == 1
-    answer("goodbye", item_id="greetings:0", kind="choose", final="1")
-    state = client.app.state.focus_store.section("spanish")
-    assert state["items"]["greetings:0"]["streak"] == 0
+    assert client.app.state.focus_stt.calls[0][2] == "es"
+    # A "what does it mean" card is also answered by saying the Spanish.
+    assert answer("hola", item_id="greetings:0", kind="choose")["correct"] is True
+    assert streak("greetings:0") == 2
+    miss = answer("adiós", item_id="greetings:0", kind="type")
+    assert miss["correct"] is False and miss["command"] is None
+    assert streak("greetings:0") == 2
+    answer("adiós", item_id="greetings:0", kind="type", final="1")
+    assert streak("greetings:0") == 0
     skip = answer("I know this", item_id="greetings:1", kind="intro")
     assert skip["command"] == "skip" and skip["correct"] is False
-    state = client.app.state.focus_store.section("spanish")
-    assert state["items"]["greetings:1"]["streak"] == 3
+    assert streak("greetings:1") == 3
     assert answer("stop", item_id="greetings:2", kind="type")["command"] == "stop"
     bad = answer("x", item_id="greetings:2", kind="nope")
     assert bad == {"detail": "Unknown card kind"}
 
 
-def test_voice_lesson_handles_spanish_read_aloud_and_the_wake_word(client):
+def test_voice_lesson_ignores_invented_phrases_and_hears_the_wake_word(client):
     files = {"file": ("a.mp4", b"abc", "audio/mp4")}
 
     def answer(heard, **data):
         client.app.state.focus_stt = _Stt(heard)
         return client.post("/v1/focus/spanish/voice", files=files, data=data).json()
 
-    # Asked what "bien, gracias" means, the learner says the Spanish itself.
-    out = answer("Bien, gracias.", item_id="greetings:5", kind="choose", final="1")
-    assert out["command"] == "said_spanish" and out["correct"] is False
+    ghost = answer(
+        "Thank you very much.", item_id="greetings:5", kind="choose", final="1"
+    )
+    assert ghost["command"] == "unclear" and ghost["correct"] is False
     assert client.app.state.focus_store.section("spanish")["items"] == {}
-    right = answer("Fine, thank you.", item_id="greetings:5", kind="choose")
+    right = answer("Bien, gracias.", item_id="greetings:5", kind="choose")
     assert right["correct"] is True
     wake = answer(
         "Hey Jarvis, add milk to my list.", item_id="greetings:0", kind="type"
     )
     assert wake["command"] == "wake"
     assert wake["wake_text"] == "Hey Jarvis, add milk to my list."
+
+
+def test_steered_transcription_uses_the_model_and_falls_back():
+    from openjarvis.server.focus_routes import _steered_transcribe
+
+    class Segment:
+        def __init__(self, text, no_speech_prob=0.0):
+            self.text, self.no_speech_prob = text, no_speech_prob
+
+    class Model:
+        def __init__(self):
+            self.calls = []
+
+        def transcribe(self, path, **options):
+            self.calls.append(options)
+            return iter([Segment(" hola"), Segment(" ruido", 0.95)]), None
+
+    class Backend(_Stt):
+        def __init__(self, model):
+            super().__init__("plain path")
+            self.model = model
+
+        def _ensure_model(self):
+            if self.model is None:
+                raise RuntimeError("no model")
+            return self.model
+
+    model = Model()
+    text = _steered_transcribe(Backend(model), b"abc", "mp4", "es", "hola, adiós")
+    assert text == "hola"
+    assert model.calls[0]["initial_prompt"] == "hola, adiós"
+    assert model.calls[0]["language"] == "es" and model.calls[0]["vad_filter"] is True
+    assert _steered_transcribe(Backend(None), b"abc", "mp4", "es", "") == "plain path"

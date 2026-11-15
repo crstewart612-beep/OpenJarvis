@@ -350,10 +350,37 @@ def close_enough(expected: str, heard: str, threshold: float = 0.8) -> bool:
     return difflib.SequenceMatcher(None, want, said).ratio() >= threshold
 
 
-def check_voice(item_id: str, kind: str, heard: str) -> bool:
-    """Was the spoken answer right? ``choose`` cards are answered in English."""
-    item = _ITEMS[item_id]
-    return close_enough(item["en"] if kind == "choose" else item["es"], heard)
+def check_voice(item_id: str, heard: str) -> bool:
+    """Was the item's Spanish said? Every voice card is answered in Spanish."""
+    return close_enough(_ITEMS[item_id]["es"], heard)
+
+
+# Phrases small speech recognition models invent when the audio is unclear.
+_GHOSTS = {
+    "thank you very much",
+    "thanks for watching",
+    "thank you for watching",
+    "thank you so much for watching",
+    "please subscribe",
+    "gracias por ver el video",
+    "gracias por ver",
+    "subtitulos realizados por la comunidad de amara org",
+    "subtitulos por la comunidad de amara org",
+    "suscribete",
+    "suscribete al canal",
+}
+
+
+def is_ghost(heard: str) -> bool:
+    """True for text the recogniser tends to make up from noise."""
+    return normalize(heard) in _GHOSTS
+
+
+def unit_vocabulary(item_id: str) -> List[str]:
+    """Spanish phrases of the item's unit, to steer speech recognition."""
+    unit_id = _ITEMS[item_id]["unit"]
+    unit = next(u for u in UNITS if u["id"] == unit_id)
+    return [i["es"] for i in unit["items"]]
 
 
 def known_phrases(state: Dict[str, Any], limit: int = 60) -> List[str]:

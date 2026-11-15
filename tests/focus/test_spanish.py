@@ -114,11 +114,19 @@ def test_spoken_counts_as_correct_and_known_phrases():
 
 
 def test_voice_checks_are_forgiving():
-    assert spanish.check_voice("greetings:8", "choose", "You are welcome.")
-    assert spanish.check_voice("greetings:2", "choose", "good afternoon")
-    assert not spanish.check_voice("greetings:2", "choose", "goodbye")
-    assert spanish.check_voice("greetings:4", "type", "Como estas")
-    assert not spanish.check_voice("greetings:0", "type", "")
+    assert spanish.check_voice("greetings:5", "Bien gracias")
+    assert spanish.check_voice("greetings:4", "Como estas")
+    assert spanish.check_voice("greetings:1", "eh, buenos dias!")
+    assert not spanish.check_voice("greetings:5", "Thank you very much.")
+    assert not spanish.check_voice("greetings:0", "")
+
+
+def test_ghost_phrases_and_unit_vocabulary():
+    assert spanish.is_ghost("Thank you very much.")
+    assert spanish.is_ghost("¡Gracias por ver el video!")
+    assert not spanish.is_ghost("gracias")
+    assert spanish.unit_vocabulary("greetings:3")[0] == "hola"
+    assert "cero" in spanish.unit_vocabulary("numbers-2:0")
 
 
 def test_spoken_lesson_commands():
