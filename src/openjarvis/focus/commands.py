@@ -191,13 +191,54 @@ def describe_when(when: datetime, has_time: bool, now: datetime) -> str:
 
 
 def _title(text: str) -> str:
-    t = re.sub(r"^(?:to|a|an|the|that)\s+", "", text.strip())
+    t = re.sub(r"^(?:to|a|an|the|that|my|me)\s+", "", text.strip())
     t = re.sub(r"\s+(?:for|on|by|at|to|in|due)$", "", t).strip(" -:")
     return t[:1].upper() + t[1:]
 
 
+# Words that stand in for "I have not said what yet".
+_VAGUE = {"", "something", "some thing", "a thing", "thing", "an item", "item", "it"}
+_VAGUE |= {"this", "that", "stuff", "one", "something else", "a task", "a to do"}
+_QUESTION = re.compile(
+    r"^(?:what|what's|who|who's|when|where|why|how|is|are|was|do|does|did|can|could|"
+    r"will|would|should|tell me|explain|define)\b"
+)
+
+
+def _task(body: str, now: datetime) -> Dict[str, Any]:
+    when, rest, has_time = parse_when(body.strip(), now)
+    title = _title(rest)
+    # Speech recognition sometimes drops words: "add something to do list".
+    core = re.sub(
+        r"\s*(?:to )?(?:my )?(?:to-?\s?do|todo)?\s*list$", "", normalize(title)
+    )
+    if core in _VAGUE:
+        return {"intent": "ask", "pending": "task"}
+    return {
+        "intent": "task",
+        "title": title,
+        "due": when.isoformat(timespec="minutes") if when else None,
+        "when": describe_when(when, has_time, now) if when else "",
+    }
+
+
 _LIST = r"(?:my |the |our )?"
 _ADD = r"(?:please )?(?:can you |could you )?(?:add|put|save|schedule|set)\s+"
+
+
+def interpret_pending(
+    pending: str, text: str, now: Optional[datetime] = None
+) -> Dict[str, Any]:
+    """Finish a command Jarvis had to ask about ("What should I add?")."""
+    now = now or datetime.now()
+    t = normalize(text)
+    if re.search(r"^(?:never ?mind|nothing|cancel|forget it|no|nope)\b", t):
+        return {"intent": "cancel"}
+    if pending.startswith("confirm:"):
+        if re.search(r"^(?:yes|yeah|yep|sure|please|ok|okay|do it|add it)\b", t):
+            return _task(pending[len("confirm:") :], now)
+        return {"intent": "cancel"}
+    return _task(t, now)
 
 
 def interpret(text: str, now: Optional[datetime] = None) -> Dict[str, Any]:
@@ -218,7 +259,9 @@ def interpret(text: str, now: Optional[datetime] = None) -> Dict[str, Any]:
     ):
         return {"intent": "action", "action": "step_done"}
     if re.search(r"\bspanish\b", t) and re.search(
-        r"\b(?:start|practice|practise|let's|lets|teach|talk|speak)\b", t
+        r"\b(?:start|practice|practise|let's|lets|teach|talk|speak|learn|study|"
+        r"review|lesson|continue|resume)\b",
+        t,
     ):
         return {"intent": "action", "action": "spanish"}
 
@@ -277,21 +320,30 @@ def interpret(text: str, now: Optional[datetime] = None) -> Dict[str, Any]:
         + r"(?:calendar|to-?\s?do(?:s| list)?|task list|tasks?|list|schedule)\b"
     )
     m = re.search("^" + _ADD + r"(.+?)" + place + r"(.*)$", t)
-    body = f"{m.group(1)} {m.group(2)}" if m else None
-    if body is None:
-        m = re.search(
-            r"^(?:remind me|i need|i have|i must|don't forget)\s+(?:to |about )?(.+)$",
-            t,
-        )
-        body = m.group(1) if m else None
-    if body is not None:
-        when, rest, has_time = parse_when(body.strip(), now)
-        title = _title(rest)
-        if title:
-            return {
-                "intent": "task",
-                "title": title,
-                "due": when.isoformat(timespec="minutes") if when else None,
-                "when": describe_when(when, has_time, now) if when else "",
-            }
-    return {"intent": "unknown", "text": text.strip()}
+    if m:
+        return _task(f"{m.group(1)} {m.group(2)}", now)
+    m = re.search(
+        r"^(?:remind me|i need|i have|i've got|i got|i must|i want|i should|"
+        r"don't forget|do not forget)\s+(?:to |about )?(.+)$",
+        t,
+    ) or re.search(
+        "^" + _ADD + r"(?:a |an |my |the )?(?:new )?"
+        r"(?:(?:to-?\s?do|task|reminder|event)\s+)?(?:to |for |about |called )?(.+)$",
+        t,
+    )
+    if m:
+        return _task(m.group(1), now)
+    if _QUESTION.search(t):
+        return {"intent": "question", "text": text.strip()}
+    # A plain statement such as "I'm picking up laundry tomorrow". If it
+    # carries a date it is treated as something to do; otherwise ask first.
+    statement = re.sub(
+        r"^(?:i'm|i am|i'll|i will|we're|we are|we will|i'm going to|"
+        r"i am going to|going to|gonna)\s+",
+        "",
+        t,
+    )
+    when, _rest, _timed = parse_when(statement, now)
+    if when is not None:
+        return _task(statement, now)
+    return {"intent": "confirm", "title": _title(statement)}

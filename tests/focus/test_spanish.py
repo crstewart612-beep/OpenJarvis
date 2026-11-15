@@ -111,3 +111,18 @@ def test_spoken_counts_as_correct_and_known_phrases():
         spanish.answer(state, "greetings:0", "spoken")
     assert state["items"]["greetings:0"]["streak"] == spanish.MASTERED
     assert spanish.known_phrases(state) == ["hola"]
+
+
+def test_voice_checks_are_forgiving():
+    assert spanish.check_voice("greetings:8", "choose", "You are welcome.")
+    assert spanish.check_voice("greetings:2", "choose", "good afternoon")
+    assert not spanish.check_voice("greetings:2", "choose", "goodbye")
+    assert spanish.check_voice("greetings:4", "type", "Como estas")
+    assert not spanish.check_voice("greetings:0", "type", "")
+
+
+def test_spoken_lesson_commands():
+    assert spanish.spoken_command("Stop.") == "stop"
+    assert spanish.spoken_command("I know this one") == "skip"
+    assert spanish.spoken_command("say it again") == "repeat"
+    assert spanish.spoken_command("hola") is None

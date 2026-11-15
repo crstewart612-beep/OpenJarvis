@@ -2,7 +2,12 @@ from datetime import datetime
 
 import pytest
 
-from openjarvis.focus.commands import extract_command, interpret, parse_when
+from openjarvis.focus.commands import (
+    extract_command,
+    interpret,
+    interpret_pending,
+    parse_when,
+)
 
 NOW = datetime(2026, 11, 15, 10, 0)  # a Sunday
 
@@ -92,5 +97,45 @@ def test_actions_email_and_unknown():
     assert interpret("let's practice Spanish", NOW)["action"] == "spanish"
     assert interpret("stop listening", NOW)["action"] == "stop"
     assert interpret("group my emails", NOW) == {"intent": "email"}
-    assert interpret("what is twelve times eight", NOW)["intent"] == "unknown"
+    assert interpret("what is twelve times eight", NOW)["intent"] == "question"
     assert interpret("", NOW) == {"intent": "none"}
+
+
+@pytest.mark.parametrize(
+    "said",
+    [
+        "I'm picking up laundry tomorrow",
+        "add my picking up laundry tomorrow",
+        "pick up laundry tomorrow",
+        "I need to pick up my laundry tomorrow",
+        "add picking up my laundry tomorrow to my to-do list",
+    ],
+)
+def test_natural_phrasing_becomes_a_dated_task(said):
+    out = interpret(said, NOW)
+    assert out["intent"] == "task"
+    assert "laundry" in out["title"].lower()
+    assert out["due"] == "2026-11-16T23:59"
+
+
+@pytest.mark.parametrize(
+    "said",
+    ["add something to my to do list", "Add something to do list.", "add a thing"],
+)
+def test_vague_request_asks_what_to_add(said):
+    assert interpret(said, NOW) == {"intent": "ask", "pending": "task"}
+
+
+def test_follow_up_answers():
+    out = interpret_pending("task", "pick up laundry tomorrow", NOW)
+    assert (out["title"], out["when"]) == ("Pick up laundry", "tomorrow")
+    assert interpret_pending("task", "never mind", NOW) == {"intent": "cancel"}
+    assert interpret("the sky looks nice", NOW)["intent"] == "confirm"
+    yes = interpret_pending("confirm:call the bank", "yes please", NOW)
+    assert yes["title"] == "Call the bank"
+    assert interpret_pending("confirm:call the bank", "uh", NOW)["intent"] == "cancel"
+
+
+def test_spanish_requests():
+    for said in ("teach me Spanish", "I want to learn Spanish", "continue my Spanish"):
+        assert interpret(said, NOW) == {"intent": "action", "action": "spanish"}

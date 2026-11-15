@@ -335,4 +335,66 @@ def test_unknown_command_is_answered_by_the_model(client):
     out = client.post(
         "/v1/focus/command", json={"text": "Jarvis, what is twelve times eight?"}
     ).json()
-    assert out["intent"] == "unknown" and out["say"] == "Ninety-six."
+    assert out["intent"] == "question" and out["say"] == "Ninety-six."
+
+
+def test_vague_command_asks_then_adds(client):
+    ask = client.post(
+        "/v1/focus/command", json={"text": "Hey Jarvis, add something to my to do list"}
+    ).json()
+    assert ask["say"] == "What should I add?" and ask["pending"] == "task"
+    assert client.get("/v1/focus/state").json()["tasks"] == []
+    done = client.post(
+        "/v1/focus/command",
+        json={"text": "Pick up laundry tomorrow.", "pending": "task"},
+    ).json()
+    assert done["say"] == "Added Pick up laundry for tomorrow."
+    assert done["pending"] == ""
+    tasks = client.get("/v1/focus/state").json()["tasks"]
+    assert [t["title"] for t in tasks] == ["Pick up laundry"]
+
+
+def test_statement_with_a_date_is_added_and_others_are_confirmed(client):
+    out = client.post(
+        "/v1/focus/command", json={"text": "Jarvis, I'm picking up laundry tomorrow"}
+    ).json()
+    assert out["say"] == "Added Picking up laundry for tomorrow."
+    ask = client.post(
+        "/v1/focus/command", json={"text": "Jarvis, call the bank"}
+    ).json()
+    assert ask["say"] == "Should I add Call the bank to your to-dos?"
+    yes = client.post(
+        "/v1/focus/command", json={"text": "yes", "pending": ask["pending"]}
+    ).json()
+    assert yes["say"] == "Added Call the bank."
+
+
+def test_parse_steps_ignores_empty_output():
+    assert parse_steps("[]") == []
+    assert parse_steps("- []\n1. Open mail") == ["Open mail"]
+
+
+def test_voice_lesson_gives_a_second_try(client):
+    files = {"file": ("a.mp4", b"abc", "audio/mp4")}
+
+    def answer(heard, **data):
+        client.app.state.focus_stt = _Stt(heard)
+        return client.post("/v1/focus/spanish/voice", files=files, data=data).json()
+
+    ok = answer("Hola.", item_id="greetings:0", kind="intro")
+    assert ok["correct"] is True and ok["command"] is None
+    miss = answer("goodbye", item_id="greetings:0", kind="choose")
+    assert miss["correct"] is False
+    assert client.app.state.focus_stt.calls[0][2] == "en"
+    state = client.app.state.focus_store.section("spanish")
+    assert state["items"]["greetings:0"]["streak"] == 1
+    answer("goodbye", item_id="greetings:0", kind="choose", final="1")
+    state = client.app.state.focus_store.section("spanish")
+    assert state["items"]["greetings:0"]["streak"] == 0
+    skip = answer("I know this", item_id="greetings:1", kind="intro")
+    assert skip["command"] == "skip" and skip["correct"] is False
+    state = client.app.state.focus_store.section("spanish")
+    assert state["items"]["greetings:1"]["streak"] == 3
+    assert answer("stop", item_id="greetings:2", kind="type")["command"] == "stop"
+    bad = answer("x", item_id="greetings:2", kind="nope")
+    assert bad == {"detail": "Unknown card kind"}

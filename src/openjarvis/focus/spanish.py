@@ -8,6 +8,7 @@ arrives as older material is learned.
 
 from __future__ import annotations
 
+import difflib
 import random
 import re
 import unicodedata
@@ -316,6 +317,43 @@ def heard_matches(item_id: str, heard: str) -> bool:
     expected = normalize(_ITEMS[item_id]["es"])
     said = normalize(heard)
     return bool(said) and f" {expected} " in f" {said} "
+
+
+_VOICE_COMMANDS = {
+    "stop": ("stop", "that's enough", "thats enough", "i'm done", "im done", "exit")
+    + ("quit", "para", "alto", "basta", "end the lesson", "finish"),
+    "skip": ("skip", "i know this", "i know that", "i know it", "next", "saltar"),
+    "repeat": ("repeat", "again", "say it again", "one more time", "otra vez")
+    + ("repite", "repeat that", "say that again"),
+}
+
+
+def spoken_command(heard: str) -> Optional[str]:
+    """A lesson command said aloud instead of an answer, if any."""
+    said = normalize(heard.replace("'", ""))
+    for name, phrases in _VOICE_COMMANDS.items():
+        for phrase in phrases:
+            key = normalize(phrase.replace("'", ""))
+            if said == key or said.startswith(key + " "):
+                return name
+    return None
+
+
+def close_enough(expected: str, heard: str, threshold: float = 0.8) -> bool:
+    """Forgiving match for speech: contained, or nearly the same letters."""
+    want = normalize(expected.replace("'", ""))
+    said = normalize(heard.replace("'", ""))
+    if not want or not said:
+        return False
+    if f" {want} " in f" {said} ":
+        return True
+    return difflib.SequenceMatcher(None, want, said).ratio() >= threshold
+
+
+def check_voice(item_id: str, kind: str, heard: str) -> bool:
+    """Was the spoken answer right? ``choose`` cards are answered in English."""
+    item = _ITEMS[item_id]
+    return close_enough(item["en"] if kind == "choose" else item["es"], heard)
 
 
 def known_phrases(state: Dict[str, Any], limit: int = 60) -> List[str]:

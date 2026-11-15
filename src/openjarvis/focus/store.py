@@ -100,6 +100,19 @@ class FocusStore:
                     return task
         return None
 
+    def set_steps(self, task_id: str, steps: List[str]) -> bool:
+        """Replace a task's steps, but only while it has not been started."""
+        if not steps:
+            return False
+        with self._lock:
+            data = self._load()
+            for task in data["tasks"]:
+                if task["id"] == task_id and task["step"] == 0 and not task["done"]:
+                    task["steps"] = steps
+                    self._save(data)
+                    return True
+        return False
+
     def remove_task(self, task_id: str) -> bool:
         return self._remove("tasks", task_id)
 

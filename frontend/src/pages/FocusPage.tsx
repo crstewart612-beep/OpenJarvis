@@ -46,12 +46,15 @@ const fmtTimer = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 const localDate = (d: Date) =>
   `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-/** "3:00 PM" for today, "Nov 16, 3:00 PM" for any other day. */
+/** "3:00 PM" for today, "Nov 16, 3:00 PM" for another day, "Nov 16" with no time. */
 const fmtDue = (iso: string) => {
   const d = new Date(iso);
+  const today = localDate(d) === localDate(new Date());
+  const day = d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  // 11:59 PM is how "that day, no particular time" is stored.
+  if (d.getHours() === 23 && d.getMinutes() === 59) return today ? 'today' : day;
   const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-  if (localDate(d) === localDate(new Date())) return time;
-  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
+  return today ? time : `${day}, ${time}`;
 };
 
 async function send(path: string, method: string, body?: unknown, signal?: AbortSignal): Promise<Response> {
@@ -88,12 +91,23 @@ function stopSpeaking(): void {
   playing = null;
 }
 
+// Lines Jarvis says often ("Correct.", "What does that mean?") are kept after
+// the first time so they play at once instead of being generated again.
+const spoken = new Map<string, AudioBuffer>();
+
 /** Speak text in one of the voices. Resolves when playback has finished. */
 async function speak(text: string, mode: 'calm' | 'deadline' | 'es', signal?: AbortSignal): Promise<void> {
   try {
-    const res = await send('/v1/focus/speak', 'POST', { text, mode }, signal);
-    if (!res.ok || !out) return;
-    const buffer = await out.decodeAudioData(await res.arrayBuffer());
+    if (!out || !text.trim()) return;
+    const key = `${mode}:${text}`;
+    let buffer = spoken.get(key);
+    if (!buffer) {
+      const res = await send('/v1/focus/speak', 'POST', { text, mode }, signal);
+      if (!res.ok) return;
+      buffer = await out.decodeAudioData(await res.arrayBuffer());
+      if (spoken.size > 150) spoken.clear();
+      spoken.set(key, buffer);
+    }
     if (signal?.aborted) return;
     if (out.state === 'suspended') await out.resume();
     stopSpeaking();
@@ -108,6 +122,22 @@ async function speak(text: string, mode: 'calm' | 'deadline' | 'es', signal?: Ab
     });
   } catch {
     // Voice is optional: the screen still shows the same words.
+  }
+}
+
+/** A short tone: instant feedback that Jarvis heard its name or is listening. */
+function chime(freq = 880): void {
+  try {
+    if (!out || out.state !== 'running') return;
+    const osc = out.createOscillator();
+    const gain = out.createGain();
+    osc.frequency.value = freq;
+    gain.gain.value = 0.06;
+    osc.connect(gain).connect(out.destination);
+    osc.start();
+    osc.stop(out.currentTime + 0.11);
+  } catch {
+    // No tone is fine.
   }
 }
 
@@ -570,18 +600,107 @@ export function FocusPage() {
     }
   };
 
-  const startTalk = () => {
+  // Voice lesson: Jarvis reads each card aloud and checks the spoken answer,
+  // following the same mastery rules as the buttons.
+  const runLesson = async () => {
+    const abort = new AbortController();
+    talkAbort.current = abort;
+    const tell = (text: string, mode: 'calm' | 'es' = 'calm') => speak(text, mode, abort.signal);
+    const cancelled = () => !talkRef.current;
+    let history: TalkTurn[] = [];
+    const push = (turn: TalkTurn) => { history = [...history, turn].slice(-12); setTurns(history); };
+    try {
+      await openMic();
+      const first = await send('/v1/focus/spanish', 'GET', undefined, abort.signal).catch(() => null);
+      if (!first?.ok) throw new Error(await errorDetail(first, 'The lesson could not load.'));
+      let current: SpanishLesson = await first.json();
+      setLesson(current);
+      await tell('Picking up where you left off.');
+      let silent = 0;
+      while (talkRef.current) {
+        const card = current.card;
+        if (!card) { await tell('You have mastered every unit. Well done.'); break; }
+        const prompt = async () => {
+          setTalkStatus('Speaking…');
+          if (card.kind === 'type') { await tell(`How do you say, ${card.en}?`); return; }
+          await tell(card.es, 'es');
+          await tell(card.kind === 'intro' ? `That means ${card.en}. Now you say it.` : 'What does that mean?');
+        };
+        await prompt();
+        let attempts = 0;
+        let next: SpanishLesson | null = null;
+        while (talkRef.current && !next) {
+          setTalkStatus('Listening… your turn.');
+          chime();
+          const rec = await recordUtterance({ waitMs: 9000, silenceMs: 900, maxMs: 10000, cancelled });
+          if (!talkRef.current) break;
+          if (!rec) {
+            silent += 1;
+            if (silent >= 3) {
+              await tell('I will pause the lesson. Say, hey Jarvis, teach me Spanish, when you are ready.');
+              talkRef.current = false;
+              break;
+            }
+            await tell('I did not hear you.');
+            await prompt();
+            continue;
+          }
+          silent = 0;
+          attempts += 1;
+          setTalkStatus('Checking…');
+          const res = await apiFetch('/v1/focus/spanish/voice', {
+            method: 'POST', signal: abort.signal,
+            body: audioForm(rec, { item_id: card.item_id, kind: card.kind, final: attempts >= 2 ? '1' : '0' }),
+          }).catch(() => null);
+          if (!res?.ok) throw new Error(await errorDetail(res, 'I could not check that.'));
+          const data = await res.json() as { heard: string; correct: boolean; command: string | null; card: SpanishCard | null; progress: SpanishProgress };
+          const after = { card: data.card, progress: data.progress };
+          push({ role: 'you', text: data.heard || '(nothing clear)' });
+          if (data.command === 'stop') { talkRef.current = false; break; }
+          if (data.command === 'repeat') { attempts -= 1; await prompt(); continue; }
+          if (data.command === 'skip') { setFeedback(null); await tell('Skipped.'); next = after; break; }
+          if (data.correct) {
+            setFeedback({ ok: true, text: `Correct: ${card.es} = ${card.en}` });
+            chime(1320);
+            await tell('Correct.');
+            next = after;
+          } else if (attempts < 2) {
+            setFeedback({ ok: false, text: `I heard "${data.heard || 'nothing clear'}". One more try.` });
+            await tell('Not quite. Try once more.');
+            if (card.kind !== 'choose') await tell(card.es, 'es');
+          } else {
+            setFeedback({ ok: false, text: `Not yet: ${card.es} = ${card.en}` });
+            if (card.kind === 'choose') await tell(`It means ${card.en}.`);
+            else { await tell('It is,'); await tell(card.es, 'es'); }
+            next = after;
+          }
+        }
+        if (next) { current = next; setLesson(next); }
+      }
+      setTalkStatus('');
+    } catch (err) {
+      setTalkStatus(abort.signal.aborted ? '' : err instanceof Error ? err.message : 'The lesson stopped.');
+    } finally {
+      talkRef.current = false;
+      setTalking(false);
+      closeMic();
+    }
+  };
+
+  const startTalk = (mode: 'lesson' | 'free' = 'lesson') => {
     if (talkRef.current) return;
     unlockAudio();
     talkRef.current = true;
     setTalking(true);
     setTurns([]);
-    void runTalk();
+    void (mode === 'lesson' ? runLesson() : runTalk());
   };
 
-  const toggleTalk = () => {
-    if (talking) { talkRef.current = false; talkAbort.current?.abort(); stopSpeaking(); setTalkStatus(''); return; }
-    startTalk();
+  const stopTalk = () => {
+    talkRef.current = false;
+    talkAbort.current?.abort();
+    stopSpeaking();
+    setTalkStatus('');
   };
 
   const changeAutoListen = (on: boolean) => {
@@ -592,11 +711,13 @@ export function FocusPage() {
   // "Hey Jarvis": listen all the time, act only on speech that names Jarvis.
   const runWake = async () => {
     let awakeUntil = 0;
+    let pending = '';
     try {
       await openMic();
       while (wakeRef.current) {
         if (talkRef.current || busyRef.current) { await sleep(400); continue; }
         const awake = Date.now() < awakeUntil;
+        if (!awake) pending = '';
         setWakeStatus(awake ? 'Yes? Go ahead.' : 'Say "Hey Jarvis", then what you need.');
         const rec = await recordUtterance({
           waitMs: 30000, silenceMs: 900, maxMs: 12000,
@@ -607,11 +728,14 @@ export function FocusPage() {
         if (!heard?.ok) throw new Error(await errorDetail(heard, 'I could not hear that.'));
         const text = ((await heard.json()).text as string).trim();
         if (!text || !wakeRef.current) continue;
-        const res = await send('/v1/focus/command', 'POST', { text, awake: Date.now() < awakeUntil }).catch(() => null);
+        const stillAwake = Date.now() < awakeUntil;
+        const res = await send('/v1/focus/command', 'POST', { text, awake: stillAwake, pending: stillAwake ? pending : '' }).catch(() => null);
         if (!res?.ok) continue;
-        const out = await res.json() as { wake: boolean; heard: string; intent?: string; say?: string; action?: string | null };
+        const out = await res.json() as { wake: boolean; heard: string; intent?: string; say?: string; action?: string | null; pending?: string };
         if (!out.wake) continue;
-        awakeUntil = out.intent === 'none' ? Date.now() + 12000 : 0;
+        chime();
+        pending = out.pending || '';
+        awakeUntil = out.intent === 'none' || pending ? Date.now() + 15000 : 0;
         setWakeStatus(`Heard: ${out.heard}`);
         if (out.say) { setSay(out.say); await speak(out.say, 'calm'); }
         await refresh();
@@ -691,7 +815,7 @@ export function FocusPage() {
   actionsRef.current = {
     startSprint: () => { if (!running) toggleSprint(); },
     stepDone: () => { void stepDone(); },
-    startTalk,
+    startTalk: () => startTalk('lesson'),
   };
 
   const status = running ? 'Focus sprint' : mode === 'deadline' ? 'Overdue' : left < SPRINT_SECONDS && left > 0 ? 'Paused' : 'Ready';
@@ -872,7 +996,14 @@ export function FocusPage() {
                   )}
                   {feedback && <p className={feedback.ok ? 'fb ok' : 'fb bad'} aria-live="polite">{feedback.text}</p>}
                   <div className="talk">
-                    <button className={talking ? 'primary' : ''} onClick={toggleTalk} disabled={micBusy || (!sttReady && !talking)}>{talking ? 'Stop talking' : 'Talk with Jarvis'}</button>
+                    {talking ? (
+                      <button className="primary" onClick={stopTalk}>Stop</button>
+                    ) : (
+                      <div className="row" style={{ justifyContent: 'center' }}>
+                        <button className="primary" onClick={() => startTalk('lesson')} disabled={micBusy || !sttReady}>Voice lesson</button>
+                        <button onClick={() => startTalk('free')} disabled={micBusy || !sttReady}>Free talk</button>
+                      </div>
+                    )}
                     {!sttReady && <p className="note">Speech recognition is loading. The first time can take several minutes.</p>}
                     {talkStatus && <p className="note" aria-live="polite">{talkStatus}</p>}
                     {turns.length > 0 && (

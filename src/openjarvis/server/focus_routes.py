@@ -113,6 +113,8 @@ class CommandBody(BaseModel):
     text: str = Field(max_length=600)
     # True when the wake word was heard just before, so this is the command.
     awake: bool = False
+    # Set when Jarvis asked a follow-up question and this is the answer.
+    pending: str = Field(default="", max_length=300)
 
 
 class SpeakBody(BaseModel):
@@ -142,7 +144,7 @@ def parse_steps(text: str) -> List[str]:
     lines = [
         re.sub(r"^[\s\-\*\d\.\)]+", "", ln).strip() for ln in (text or "").splitlines()
     ]
-    return [ln for ln in lines if ln][:8]
+    return [ln for ln in lines if re.search(r"[A-Za-z]{2}", ln)][:8]
 
 
 # Online model used when an Anthropic key is saved in the app's Cloud Models
@@ -397,7 +399,7 @@ def _stt(request: Request):
     return backend
 
 
-async def _transcribe(request: Request, language: Optional[str]) -> str:
+async def _read_audio(request: Request) -> tuple:
     form = await request.form()
     upload = form.get("file")
     if upload is None or not hasattr(upload, "read"):
@@ -411,6 +413,12 @@ async def _transcribe(request: Request, language: Optional[str]) -> str:
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "wav"
     if not re.fullmatch(r"[a-z0-9]{1,5}", ext):
         ext = "wav"
+    return audio, ext
+
+
+async def _run_stt(
+    request: Request, audio: bytes, ext: str, language: Optional[str]
+) -> str:
     try:
         backend = _stt(request)
         result = await asyncio.to_thread(
@@ -422,6 +430,11 @@ async def _transcribe(request: Request, language: Optional[str]) -> str:
             status_code=503, detail="Speech recognition is not available"
         ) from exc
     return (result.text or "").strip()
+
+
+async def _transcribe(request: Request, language: Optional[str]) -> str:
+    audio, ext = await _read_audio(request)
+    return await _run_stt(request, audio, ext, language)
 
 
 @focus_router.post("/listen/warm")
@@ -475,6 +488,57 @@ async def spanish_say(request: Request):
     return {
         "heard": heard,
         "correct": correct,
+        "es": item["es"],
+        "en": item["en"],
+        "card": spanish.next_card(state),
+        "progress": spanish.progress(state),
+    }
+
+
+@focus_router.post("/spanish/voice")
+async def spanish_voice(request: Request):
+    """One spoken answer in a voice lesson, or a spoken lesson command.
+
+    A miss changes nothing unless ``final`` is set, so the learner gets a
+    second try before a slip (or a recognition error) costs any progress.
+    """
+    form = await request.form()
+    item_id = form.get("item_id")
+    kind = form.get("kind")
+    if not isinstance(item_id, str) or item_id not in spanish._ITEMS:
+        raise HTTPException(status_code=400, detail="Unknown item")
+    if kind not in ("intro", "choose", "type"):
+        raise HTTPException(status_code=400, detail="Unknown card kind")
+    final = form.get("final") == "1"
+    audio, ext = await _read_audio(request)
+    language = "en" if kind == "choose" else "es"
+    heard = await _run_stt(request, audio, ext, language)
+    item = spanish._ITEMS[item_id]
+    correct = spanish.check_voice(item_id, kind, heard)
+    command = None
+    if not correct:
+        command = spanish.spoken_command(heard)
+        if command is None and language == "es":
+            # "Skip" or "stop" said in English is garbled by Spanish recognition.
+            command = spanish.spoken_command(await _run_stt(request, audio, ext, "en"))
+    state = _spanish_state(request)
+    if command == "skip":
+        spanish.answer(state, item_id, "skip")
+    elif command is None and correct:
+        if kind == "intro":
+            spanish.answer(state, item_id, "spoken")
+        else:
+            right = item["en"] if kind == "choose" else item["es"]
+            spanish.answer(state, item_id, "answer", right)
+    elif command is None and final:
+        spanish.answer(state, item_id, "seen" if kind == "intro" else "answer", "")
+    else:
+        spanish.touch(state)
+    _store(request).save_section("spanish", state)
+    return {
+        "heard": heard,
+        "correct": correct and command is None,
+        "command": command,
         "es": item["es"],
         "en": item["en"],
         "card": spanish.next_card(state),
@@ -544,8 +608,28 @@ async def spanish_converse(request: Request, body: ConverseBody):
 _ANSWER_PROMPT = (
     "You are Jarvis, a calm voice assistant. Answer the question below in at "
     "most two short sentences of plain spoken English, with no lists or "
-    "symbols.\n\nQuestion: {text}"
+    "symbols. You cannot take actions, set reminders or change anything, so "
+    "never say that you did or will.\n\nQuestion: {text}"
 )
+
+
+async def _improve_steps(request: Request, task_id: str, title: str) -> None:
+    """Break a voice-added to-do into steps after Jarvis has already replied."""
+    steps = await _breakdown(request, title)
+    if steps != [title]:
+        _store(request).set_steps(task_id, steps)
+
+
+def _add_spoken_task(request: Request, plan: dict) -> str:
+    task = _store(request).add_task(plan["title"], [plan["title"]], plan["due"])
+    job = asyncio.create_task(_improve_steps(request, task["id"], plan["title"]))
+    jobs = getattr(request.app.state, "focus_jobs", None)
+    if jobs is None:
+        jobs = request.app.state.focus_jobs = set()
+    jobs.add(job)
+    job.add_done_callback(jobs.discard)
+    when = f" for {plan['when']}" if plan["when"] else ""
+    return f"Added {plan['title']}{when}."
 
 
 @focus_router.post("/command")
@@ -554,20 +638,28 @@ async def voice_command(request: Request, body: CommandBody):
     heard = body.text.strip()
     command = commands.extract_command(heard)
     if command is None:
-        if not body.awake:
+        if not (body.awake or body.pending):
             return {"wake": False, "heard": heard}
         command = heard
+    out = {"wake": True, "heard": heard, "action": None, "pending": ""}
     if not command:
-        return {"wake": True, "heard": heard, "intent": "none", "say": "Yes?"}
+        return {**out, "intent": "none", "say": "Yes?", "pending": body.pending}
     store = _store(request)
-    plan = commands.interpret(command)
-    intent = plan["intent"]
-    out = {"wake": True, "heard": heard, "intent": intent, "action": None}
+    if body.pending:
+        plan = commands.interpret_pending(body.pending, command)
+    else:
+        plan = commands.interpret(command)
+    intent = out["intent"] = plan["intent"]
     if intent == "task":
-        steps = await _breakdown(request, plan["title"])
-        store.add_task(plan["title"], steps, plan["due"])
-        when = f" for {plan['when']}" if plan["when"] else ""
-        out["say"] = f"Added {plan['title']}{when}."
+        out["say"] = _add_spoken_task(request, plan)
+    elif intent == "ask":
+        out["pending"] = plan["pending"]
+        out["say"] = "What should I add?"
+    elif intent == "confirm":
+        out["pending"] = f"confirm:{plan['title']}"
+        out["say"] = f"Should I add {plan['title']} to your to-dos?"
+    elif intent == "cancel":
+        out["say"] = "Okay, never mind."
     elif intent == "capture":
         store.add_capture(plan["text"], kind=plan["kind"])
         place = "idea list" if plan["kind"] == "idea" else "brain dump"
@@ -599,7 +691,7 @@ async def voice_command(request: Request, body: CommandBody):
         except Exception:
             logger.exception("Spoken question could not be answered")
             out["say"] = ""
-        out["say"] = out["say"] or "I heard you, but I do not know how to do that yet."
+        out["say"] = out["say"] or "I do not have an answer for that."
     return out
 
 
