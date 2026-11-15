@@ -56,6 +56,8 @@ def test_gui_custom_ports_use_project_root_and_same_origin_proxy(
             "run",
             "--extra",
             "desktop",
+            "--extra",
+            "voice",
             "jarvis",
             "start",
             "--port",

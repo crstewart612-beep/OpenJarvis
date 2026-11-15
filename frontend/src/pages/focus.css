@@ -59,7 +59,8 @@
   li .end { display: flex; gap: 8px; align-items: baseline; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; }
   .row input { flex: 1; }
-  .row input[type='time'] { flex: 0 0 auto; }
+  .row input[type='time'], .row input[type='date'] { flex: 0 0 auto; }
+  .row input#focus-task { flex: 1 1 100%; }
   .core { text-align: center; display: flex; flex-direction: column; gap: 12px; align-items: center; }
   .orbbox { position: relative; width: min(100%, 380px); aspect-ratio: 1; }
   .orbbox canvas { width: 100%; height: 100%; display: block; }

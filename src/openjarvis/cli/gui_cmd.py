@@ -514,6 +514,9 @@ def gui(frontend_port: int, api_port: int, no_server: bool, no_browser: bool) ->
                 "run",
                 "--extra",
                 "desktop",
+                # Voice output (Kokoro) for the Focus HUD's spoken prompts.
+                "--extra",
+                "voice",
                 "jarvis",
                 "start",
                 "--port",

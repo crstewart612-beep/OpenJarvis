@@ -38,8 +38,15 @@ const CALM_LINE = "Take a breath. One thing at a time. I'm right here with you."
 
 const fmtTimer = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
-const fmtDue = (iso: string) =>
-  new Date(iso).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+const localDate = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+/** "3:00 PM" for today, "Nov 16, 3:00 PM" for any other day. */
+const fmtDue = (iso: string) => {
+  const d = new Date(iso);
+  const time = d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  if (localDate(d) === localDate(new Date())) return time;
+  return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
+};
 
 async function send(path: string, method: string, body?: unknown): Promise<Response> {
   return apiFetch(path, {
@@ -74,6 +81,7 @@ export function FocusPage() {
   const [say, setSay] = useState(CALM_LINE);
   const [title, setTitle] = useState('');
   const [due, setDue] = useState('');
+  const [dueDate, setDueDate] = useState(() => localDate(new Date()));
   const [capture, setCapture] = useState('');
   const [adding, setAdding] = useState(false);
   const [lesson, setLesson] = useState<SpanishLesson | null>(null);
@@ -220,16 +228,13 @@ export function FocusPage() {
     setAdding(true);
     setSay('Breaking that into small steps…');
     let dueIso: string | null = null;
-    if (due) {
-      const d = new Date();
-      const [h, m] = due.split(':').map(Number);
-      d.setHours(h, m, 0, 0);
-      dueIso = new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-    }
+    const today = localDate(new Date());
+    // A date with no time means "by the end of that day".
+    if (due || (dueDate && dueDate !== today)) dueIso = `${dueDate || today}T${due || '23:59'}`;
     const res = await send('/v1/focus/task', 'POST', { title: t, due: dueIso }).catch(() => null);
     setAdding(false);
     if (!res?.ok) { setSay('I could not save that task. Is the Jarvis server running?'); return; }
-    setTitle(''); setDue('');
+    setTitle(''); setDue(''); setDueDate(localDate(new Date()));
     setSay('Added. Here is your first small step.');
     await refresh();
   };
@@ -335,10 +340,11 @@ export function FocusPage() {
               <div className="date">{now.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}</div>
             </div>
             <div className="panel">
-              <h2>Today <span>{state ? `${state.tasks.filter((t) => !t.done).length} open` : ''}</span></h2>
+              <h2>To-dos <span>{state ? `${state.tasks.filter((t) => !t.done).length} open` : ''}</span></h2>
               <form className="row" onSubmit={addTask}>
                 <input id="focus-task" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Add a to-do" aria-label="New to-do" autoComplete="off" />
-                <input id="focus-due" type="time" value={due} onChange={(e) => setDue(e.target.value)} aria-label="Due time today" />
+                <input id="focus-due-date" type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} aria-label="Due date" />
+                <input id="focus-due" type="time" value={due} onChange={(e) => setDue(e.target.value)} aria-label="Due time" />
                 <button type="submit" disabled={adding}>{adding ? '…' : 'Add'}</button>
               </form>
               <ul style={{ marginTop: 10 }}>
@@ -346,7 +352,7 @@ export function FocusPage() {
                   <li key={t.id}>
                     <span className={t.done ? 'struck' : t.overdue ? 'late' : ''}>{t.title}</span>
                     <span className="end">
-                      <span className={`pill ${t.overdue ? 'hot' : 'ok'}`}>{t.overdue ? 'overdue' : t.done ? 'done' : t.due ? fmtDue(t.due) : 'today'}</span>
+                      <span className={`pill ${t.overdue ? 'hot' : 'ok'}`}>{t.overdue ? 'overdue' : t.done ? 'done' : t.due ? fmtDue(t.due) : 'no date'}</span>
                       <button className="small" onClick={() => void remove(`/v1/focus/task/${t.id}`)} aria-label={`Remove ${t.title}`}>×</button>
                     </span>
                   </li>
