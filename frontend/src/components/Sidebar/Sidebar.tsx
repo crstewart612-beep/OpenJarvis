@@ -17,6 +17,7 @@ import {
   Loader2,
   ScrollText,
   Database,
+  Target,
 } from 'lucide-react';
 import { ConversationList } from './ConversationList';
 import { useAppStore } from '../../lib/store';
@@ -53,6 +54,7 @@ export function Sidebar() {
   };
 
   const navItems = [
+    { path: '/focus', icon: Target, label: 'Focus' },
     { path: '/', icon: MessageSquare, label: 'Chat' },
     { path: '/dashboard', icon: BarChart3, label: 'Dashboard' },
     { path: '/data-sources', icon: Database, label: 'Data Sources' },
