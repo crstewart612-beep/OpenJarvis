@@ -321,7 +321,7 @@ def test_voice_commands_change_the_right_lists(client):
     goal = say("Hey Jarvis, I made 60 dollars on MES")
     assert goal["say"] == "Added 60 dollars. Your goal is at 60 dollars."
     assert say("Hey Jarvis, start a sprint")["action"] == "sprint"
-    assert "not connected" in say("Hey Jarvis, group my emails")["say"]
+    assert "mail" in say("Hey Jarvis, group my emails")["say"].lower()
     state = client.get("/v1/focus/state").json()
     assert state["tasks"][0]["title"] == "Dentist appointment"
     assert state["tasks"][0]["due"].endswith("T15:00")
@@ -656,3 +656,121 @@ def test_calendar_route_off_the_mac(client, monkeypatch):
     monkeypatch.setattr(mac_calendar, "available", lambda: False)
     out = client.get("/v1/focus/calendar").json()
     assert out["available"] is False and out["events"] == []
+
+
+def test_duplicate_calendar_events_are_shown_once(client, monkeypatch):
+    from openjarvis.focus import mac_calendar
+
+    events = [
+        {
+            "title": "Dentist",
+            "start": "2026-11-20T15:00:00",
+            "all_day": False,
+            "calendar": "Gmail",
+        },
+        {
+            "title": "dentist ",
+            "start": "2026-11-20T15:00:30",
+            "all_day": False,
+            "calendar": "Outlook",
+        },
+        {
+            "title": "Dentist",
+            "start": "2026-11-21T15:00:00",
+            "all_day": False,
+            "calendar": "Yahoo",
+        },
+    ]
+    monkeypatch.setattr(mac_calendar, "available", lambda: True)
+    monkeypatch.setattr(
+        mac_calendar,
+        "read_events",
+        lambda: {"events": events, "source": "database", "note": ""},
+    )
+    monkeypatch.setattr(mac_calendar, "calendars", lambda: [])
+    out = client.get("/v1/focus/calendar").json()
+    assert [(e["calendar"], e["start"][:10]) for e in out["events"]] == [
+        ("Gmail", "2026-11-20"),
+        ("Yahoo", "2026-11-21"),
+    ]
+
+
+def test_mail_route_and_spoken_summary(client, monkeypatch):
+    from openjarvis.focus import mac_mail
+
+    data = {
+        "unread": 3,
+        "accounts": [{"name": "Gmail", "unread": 3}],
+        "latest": [
+            {"from": "Ana Ruiz <ana@example.com>", "subject": "Interview", "date": "x"}
+        ],
+    }
+    monkeypatch.setattr(mac_mail, "available", lambda: True)
+    monkeypatch.setattr(mac_mail, "read_unread", lambda: data)
+    assert client.get("/v1/focus/mail").json()["unread"] == 3
+    out = client.post(
+        "/v1/focus/command", json={"text": "Morpheus, check my email"}
+    ).json()
+    assert out["say"] == "You have 3 unread. The newest is from Ana Ruiz: Interview."
+    saved = client.app.state.focus_store._path
+    assert not saved.exists() or "Interview" not in saved.read_text()
+
+
+def test_online_model_reads_an_unclear_request(client, monkeypatch):
+    from openjarvis.server import cloud_router, focus_routes
+
+    async def fake_claude(api_key, prompt):
+        return '{"intent": "task", "text": "call the bank", "when": "friday at 2 pm"}'
+
+    monkeypatch.setattr(cloud_router, "_load_keys", lambda: {"ANTHROPIC_API_KEY": "k"})
+    monkeypatch.setattr(focus_routes, "_claude", fake_claude)
+    out = client.post(
+        "/v1/focus/command", json={"text": "Morpheus, call the bank"}
+    ).json()
+    assert out["intent"] == "task"
+    assert out["say"].startswith("Added Call the bank for Friday")
+    task = client.get("/v1/focus/state").json()["tasks"][0]
+    assert task["due"].endswith("T14:00")
+
+
+def test_resume_upload_and_job_search(client, monkeypatch):
+    import io
+    import zipfile
+
+    from openjarvis.server import cloud_router, focus_routes
+
+    buf = io.BytesIO()
+    body = "<w:p><w:t>Process improvement lead &amp; trainer</w:t></w:p>" * 4
+    with zipfile.ZipFile(buf, "w") as doc:
+        doc.writestr("word/document.xml", f"<w:document>{body}</w:document>")
+    replies = iter(
+        [
+            '["Process Improvement Manager", "Change Manager"]',
+        ]
+    )
+
+    async def fake_claude(api_key, prompt):
+        return next(replies)
+
+    async def fake_search(api_key, prompt):
+        assert "Process Improvement Manager" in prompt and "$65,000" in prompt
+        return (
+            'Here: [{"title": "Process Improvement Manager", "company": "Acme", '
+            '"url": "https://example.com/j/1", "salary": "$95k", "description": "x"}, '
+            '{"title": "Bad", "url": "javascript:alert(1)"}]'
+        )
+
+    monkeypatch.setattr(cloud_router, "_load_keys", lambda: {"ANTHROPIC_API_KEY": "k"})
+    monkeypatch.setattr(focus_routes, "_claude", fake_claude)
+    monkeypatch.setattr(focus_routes, "_claude_search", fake_search)
+    files = {"file": ("cv.docx", buf.getvalue(), "application/octet-stream")}
+    up = client.post("/v1/focus/jobs/resume", files=files).json()
+    assert up["has_resume"] is True
+    assert up["titles"] == ["Process Improvement Manager", "Change Manager"]
+    client.put("/v1/focus/jobs/profile", json={"min_salary": 65000})
+    assert client.post("/v1/focus/jobs/search").json() == {"added": 1, "found": 2}
+    assert client.post("/v1/focus/jobs/search").json()["added"] == 0
+    jobs = client.get("/v1/focus/state").json()["jobs"]
+    assert [j["company"] for j in jobs] == ["Acme"]
+    bad = client.post("/v1/focus/jobs/resume", files={"file": ("cv.pdf", b"x" * 80)})
+    assert bad.status_code == 400

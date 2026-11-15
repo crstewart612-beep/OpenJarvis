@@ -16,7 +16,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from openjarvis.focus import commands, mac_calendar, spanish
+from openjarvis.focus import commands, mac_calendar, mac_mail, spanish
 from openjarvis.focus.signals import (
     CONTRACTS,
     max_stop_points,
@@ -383,6 +383,42 @@ def _copy_to_calendar(request: Request, title: str, due: Optional[str]) -> None:
     _background(request, _add())
 
 
+def _unique_events(events: list) -> list:
+    """Drop an event that appears on more than one calendar at the same time."""
+    seen, out = set(), []
+    for event in events:
+        key = (
+            str(event.get("title", "")).strip().lower(),
+            str(event.get("start"))[:16],
+        )
+        if key not in seen:
+            seen.add(key)
+            out.append(event)
+    return out
+
+
+@focus_router.get("/mail")
+async def unread_mail(request: Request):
+    """Unread mail from the Mac's Mail app. Subjects are not written to disk."""
+    state = request.app.state
+    out = {"available": mac_mail.available(), "unread": 0, "accounts": [], "latest": []}
+    out["error"] = ""
+    if not out["available"]:
+        return out
+    cached = getattr(state, "focus_mail_cache", None)
+    if cached and time.monotonic() - cached[0] < 300:
+        return {**out, **cached[1]}
+    try:
+        data = await asyncio.to_thread(mac_mail.read_unread)
+    except mac_mail.MailError as exc:
+        return {**out, "error": str(exc)}
+    except Exception:
+        logger.exception("Mail read failed")
+        return {**out, "error": "Mail could not be read."}
+    state.focus_mail_cache = (time.monotonic(), data)
+    return {**out, **data}
+
+
 @focus_router.get("/calendar")
 async def calendar_events(request: Request):
     """Upcoming events from the Mac's Calendar app, cached for two minutes."""
@@ -404,6 +440,7 @@ async def calendar_events(request: Request):
         return {**out, **cached[1]}
     try:
         data = await asyncio.to_thread(mac_calendar.read_events)
+        data["events"] = _unique_events(data["events"])
         data["calendars"] = await asyncio.to_thread(mac_calendar.calendars)
     except mac_calendar.CalendarError as exc:
         return {**out, "error": str(exc)}
@@ -550,6 +587,158 @@ async def set_job_profile(request: Request, body: JobProfileBody):
         "min_salary": profile["min_salary"],
         "has_resume": bool(profile.get("resume")),
     }
+
+
+def _resume_text(name: str, raw: bytes) -> str:
+    """Plain text from an uploaded resume (.docx, .txt or .md)."""
+    lower = name.lower()
+    if lower.endswith(".docx"):
+        import io
+        import zipfile
+
+        try:
+            with zipfile.ZipFile(io.BytesIO(raw)) as doc:
+                xml = doc.read("word/document.xml").decode("utf-8", "replace")
+        except (KeyError, zipfile.BadZipFile) as exc:
+            raise HTTPException(
+                status_code=400, detail="That Word file could not be read"
+            ) from exc
+        xml = re.sub(r"</w:p>", "\n", xml)
+        xml = re.sub(r"<w:tab[^>]*/>", "\t", xml)
+        import html
+
+        return html.unescape(re.sub(r"<[^>]+>", "", xml)).strip()
+    if lower.endswith((".txt", ".md")):
+        return raw.decode("utf-8", "replace").strip()
+    raise HTTPException(
+        status_code=400, detail="Use a Word (.docx) or text (.txt) file"
+    )
+
+
+_TITLES_PROMPT = (
+    "From the resume below, suggest the five job titles this person should "
+    "search for. Reply with only a JSON array of strings.\n\nRESUME:\n{resume}"
+)
+
+
+@focus_router.post("/jobs/resume")
+async def upload_resume(request: Request):
+    """Store the resume text on this computer; suggest titles if none are set."""
+    _local_only(request)
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="Missing 'file' field")
+    raw = await upload.read()
+    if len(raw) > 5 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="That file is too large")
+    text = _resume_text(getattr(upload, "filename", "") or "", raw)[:40000]
+    if len(text) < 50:
+        raise HTTPException(status_code=400, detail="No text was found in that file")
+    store = _store(request)
+    profile = store.set_job_profile(resume=text)
+    if not profile.get("titles") and _api_key():
+        try:
+            reply = await _claude(
+                _api_key(), _TITLES_PROMPT.format(resume=text[:12000])
+            )
+            titles = [t for t in parse_steps(reply) if len(t) < 80][:6]
+            if titles:
+                profile = store.set_job_profile(titles=titles)
+        except Exception:
+            logger.exception("Could not suggest job titles")
+    return {
+        "titles": profile["titles"],
+        "min_salary": profile["min_salary"],
+        "has_resume": True,
+    }
+
+
+_SEARCH_PROMPT = (
+    "Search the web for current job postings that match all of this:\n"
+    "- Title similar to one of: {titles}\n"
+    "- Fully remote, open to people in the United States\n"
+    "- {salary}\n"
+    "Open the postings to confirm they are still accepting applications. Reply "
+    "with only a JSON array of up to 8 objects with the fields title, company, "
+    "url (the posting's own page), salary (as written, or an empty string) and "
+    "description (one sentence). Leave out anything you could not confirm."
+)
+
+
+async def _claude_search(api_key: str, prompt: str) -> str:
+    """One request with the hosted web search tool; resumes paused turns."""
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=300.0, max_retries=1)
+    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 8}]
+    messages = [{"role": "user", "content": prompt}]
+    response = None
+    for _ in range(5):
+        response = await client.messages.create(
+            model=CLOUD_MODEL, max_tokens=16000, tools=tools, messages=messages
+        )
+        if response.stop_reason != "pause_turn":
+            break
+        # A long search can pause; sending the turn back lets it continue.
+        messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": response.content},
+        ]
+    if response is None or response.stop_reason == "refusal":
+        return ""
+    return "".join(b.text for b in response.content if b.type == "text").strip()
+
+
+@focus_router.post("/jobs/search")
+async def search_jobs(request: Request):
+    """Find postings with the online model's web search and queue the new ones."""
+    _local_only(request)
+    api_key = _api_key()
+    if not api_key:
+        raise HTTPException(status_code=409, detail="Add the online model key first")
+    store = _store(request)
+    profile = store.job_profile()
+    titles = [t for t in profile.get("titles", []) if t]
+    if not titles:
+        raise HTTPException(status_code=409, detail="Add the job titles to search for")
+    floor = int(profile.get("min_salary") or 0)
+    salary = f"Pays at least ${floor:,} a year" if floor else "Any salary"
+    try:
+        reply = await _claude_search(
+            api_key, _SEARCH_PROMPT.format(titles=", ".join(titles), salary=salary)
+        )
+    except Exception as exc:
+        logger.exception("Job search failed")
+        raise HTTPException(
+            status_code=502, detail="The search did not finish"
+        ) from exc
+    match = re.search(r"\[.*\]", reply, re.DOTALL)
+    try:
+        found = json.loads(match.group(0)) if match else []
+    except ValueError:
+        found = []
+    before = {j["url"] for j in store.snapshot()["jobs"]}
+    added = 0
+    for item in found if isinstance(found, list) else []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if not (title and re.match(r"^https?://", url)) or url in before:
+            continue
+        store.add_job(
+            {
+                "title": title[:200],
+                "company": str(item.get("company", ""))[:200],
+                "url": url[:2000],
+                "salary": str(item.get("salary", ""))[:100],
+                "description": str(item.get("description", ""))[:2000],
+            }
+        )
+        before.add(url)
+        added += 1
+    return {"added": added, "found": len(found) if isinstance(found, list) else 0}
 
 
 @focus_router.post("/jobs")
@@ -909,6 +1098,45 @@ async def spanish_converse(request: Request, body: ConverseBody):
     return {**parse_tutor(reply), "progress": spanish.progress(state)}
 
 
+_INTENT_PROMPT = (
+    "A person said this to their voice assistant: {text!r}\n\n"
+    "Decide what they want and reply with only a JSON object:\n"
+    '{{"intent": one of "task", "note", "idea", "goal", "sprint", "step_done", '
+    '"spanish", "stop", "email", "answer", "none", '
+    '"text": string, "when": string, "amount": number}}\n'
+    "- task: something to do or an appointment. text = a short title in their "
+    "words; when = the date and time words copied exactly from what they said "
+    '(for example "tomorrow at 3 pm"), or "" if none.\n'
+    "- note: a thought to keep. idea: a business or project idea. text = it.\n"
+    "- goal: money made or lost toward a savings goal. amount = dollars, "
+    "negative for a loss; text = a short note.\n"
+    "- sprint: start a focus timer. step_done: they finished the current step. "
+    "spanish: start a Spanish lesson. stop: stop listening.\n"
+    "- email: anything about their inbox.\n"
+    "- answer: a question. text = your answer in at most two short spoken "
+    "sentences. You cannot take actions, so never say you did or will.\n"
+    "- none: unclear."
+)
+
+
+async def _model_plan(request: Request, command: str) -> Optional[dict]:
+    """Ask the online model what a request means. None when it cannot help."""
+    api_key = _api_key()
+    if not api_key:
+        return None
+    try:
+        raw = await _claude(api_key, _INTENT_PROMPT.format(text=command))
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        data = json.loads(match.group(0)) if match else None
+    except Exception:
+        logger.exception("Online model could not read the request")
+        return None
+    if not isinstance(data, dict):
+        return None
+    plan = commands.from_model(data)
+    return None if plan["intent"] == "none" else plan
+
+
 _ANSWER_PROMPT = (
     "You are Morpheus, a calm voice assistant. Answer the question below in at "
     "most two short sentences of plain spoken English, with no lists or "
@@ -937,6 +1165,22 @@ def _add_spoken_task(request: Request, plan: dict) -> str:
     return f"Added {plan['title']}{when}."
 
 
+async def _mail_summary(request: Request) -> str:
+    data = await unread_mail(request)
+    if not data["available"]:
+        return "I can only read mail on your Mac."
+    if data["error"]:
+        return "I could not read your mail. " + data["error"]
+    if not data["unread"]:
+        return "You have no unread mail."
+    first = data["latest"][0] if data["latest"] else None
+    line = f"You have {data['unread']} unread."
+    if first:
+        sender = re.sub(r"\s*<.*>", "", first.get("from", "")).strip() or "someone"
+        line += f" The newest is from {sender}: {first.get('subject', '')}."
+    return line
+
+
 @focus_router.post("/command")
 async def voice_command(request: Request, body: CommandBody):
     """Carry out one spoken command. Ignored unless the wake word was said."""
@@ -954,6 +1198,9 @@ async def voice_command(request: Request, body: CommandBody):
         plan = commands.interpret_pending(body.pending, command)
     else:
         plan = commands.interpret(command)
+        if plan["intent"] in ("confirm", "question"):
+            # The fixed rules were unsure; let the online model read it.
+            plan = await _model_plan(request, command) or plan
     intent = out["intent"] = plan["intent"]
     if intent == "task":
         out["say"] = _add_spoken_task(request, plan)
@@ -983,8 +1230,10 @@ async def voice_command(request: Request, body: CommandBody):
             "spanish": "",
             "stop": "Okay. I will stop listening.",
         }[plan["action"]]
+    elif intent == "answer":
+        out["say"] = plan["text"]
     elif intent == "email":
-        out["say"] = "Your email is not connected yet, so I cannot do that."
+        out["say"] = await _mail_summary(request)
     else:
         try:
             out["say"] = await _complete(

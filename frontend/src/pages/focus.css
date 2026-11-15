@@ -67,6 +67,8 @@
   .keybox form { display: flex; flex-direction: column; gap: 6px; }
   .keybox input { width: 100%; padding: 6px 8px; font-size: 13px; }
   .keybox .row { gap: 6px; }
+  .voicepick input { width: 100%; padding: 7px 9px; font-size: 13px; }
+  .voicepick input[type='file'] { padding: 6px; }
   .voicepick select { font: inherit; font-size: 13px; color: var(--fg); background: #01171a; border: 1px solid #0f5a5e; border-radius: 8px; padding: 6px 8px; width: 100%; }
   .chair { display: block; width: calc(100% + 20px); margin: 18px -10px -12px; border-radius: 0 0 12px 12px; filter: drop-shadow(0 -6px 18px #000a) saturate(0.9) brightness(0.8); }
   .phases { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; flex: 0 0 auto; }

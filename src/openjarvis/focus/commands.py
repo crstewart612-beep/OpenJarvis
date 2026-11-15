@@ -229,6 +229,34 @@ _ADD_VERB = r"(?:please )?(?:can you |could you )?(?:add|put|save|schedule|set)"
 _ADD = _ADD_VERB + r"\s+"
 
 
+def from_model(data: Dict[str, Any], now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Turn the online model's reading of a request into the same plan shape.
+
+    The model only classifies and copies words out of the request; dates are
+    still worked out here, so a wrong guess cannot invent a date.
+    """
+    now = now or datetime.now()
+    intent = str(data.get("intent", "")).lower()
+    text = str(data.get("text", "")).strip()
+    if intent == "task" and text:
+        return _task(f"{text} {data.get('when', '')}".strip(), now)
+    if intent in ("note", "idea") and text:
+        return {"intent": "capture", "kind": intent, "text": _title(text)}
+    if intent == "goal":
+        try:
+            amount = float(data.get("amount"))
+        except (TypeError, ValueError):
+            return {"intent": "none"}
+        return {"intent": "goal", "amount": amount, "note": _title(text)}
+    if intent in ("sprint", "step_done", "spanish", "stop"):
+        return {"intent": "action", "action": intent}
+    if intent == "email":
+        return {"intent": "email"}
+    if intent == "answer" and text:
+        return {"intent": "answer", "text": text}
+    return {"intent": "none"}
+
+
 def interpret_pending(
     pending: str, text: str, now: Optional[datetime] = None
 ) -> Dict[str, Any]:

@@ -41,10 +41,11 @@ interface SpanishProgress {
 interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface CalEvent { title: string; start: string; all_day: boolean; calendar: string }
 interface CalState { available: boolean; events: CalEvent[]; calendars: string[]; write_to: string; source: string; note: string; error: string }
+interface MailState { available: boolean; unread: number; accounts: { name: string; unread: number }[]; latest: { from: string; subject: string; date: string; account: string }[]; error: string }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 23';
+const BUILD = 'build 24';
 // What the assistant is called on screen and out loud.
 const NAME = 'Morpheus';
 const NAV: [string, string][] = [
@@ -380,6 +381,12 @@ export function FocusPage() {
   const [keyText, setKeyText] = useState('');
   const [keyNote, setKeyNote] = useState('');
   const [cal, setCal] = useState<CalState | null>(null);
+  const [mail, setMail] = useState<MailState | null>(null);
+  const [jobNote, setJobNote] = useState('');
+  const [jobBusy, setJobBusy] = useState(false);
+  const [jobTitles, setJobTitles] = useState('');
+  const [jobFloor, setJobFloor] = useState('');
+  const [newJob, setNewJob] = useState({ title: '', company: '', url: '' });
   const rainRef = useRef<HTMLCanvasElement>(null);
   const [taskTab, setTaskTab] = useState<'all' | 'today' | 'upcoming' | 'done'>('all');
   const [dumpText, setDumpText] = useState('');
@@ -418,6 +425,8 @@ export function FocusPage() {
       if (sp.ok) setLesson(await sp.json());
       const cl = await send('/v1/focus/calendar', 'GET');
       if (cl.ok) setCal(await cl.json());
+      const ml = await send('/v1/focus/mail', 'GET');
+      if (ml.ok) setMail(await ml.json());
     } catch {
       setOffline(true);
     }
@@ -1015,6 +1024,58 @@ export function FocusPage() {
     if (res?.ok) { setOnline(await res.json()); setKeyNote('Key removed.'); }
   };
 
+  // ---- job hunt ----
+  const uploadResume = async (file: File | undefined) => {
+    if (!file) return;
+    setJobNote('Reading your resume…');
+    const form = new FormData();
+    form.append('file', file, file.name);
+    const res = await apiFetch('/v1/focus/jobs/resume', { method: 'POST', body: form }).catch(() => null);
+    if (!res?.ok) { setJobNote(await errorDetail(res, 'The resume could not be read.')); return; }
+    const out = await res.json() as { titles: string[] };
+    setJobTitles(out.titles.join(', '));
+    setJobNote(out.titles.length ? 'Resume loaded. I suggested titles from it; change them if you like.' : 'Resume loaded. Add the titles to search for.');
+    await refresh();
+  };
+
+  const saveJobProfile = async () => {
+    const titles = jobTitles.split(',').map((t) => t.trim()).filter(Boolean);
+    const floor = Number(jobFloor) || 0;
+    const res = await send('/v1/focus/jobs/profile', 'PUT', { titles, min_salary: floor }).catch(() => null);
+    setJobNote(res?.ok ? 'Search settings saved.' : 'The settings could not be saved.');
+    await refresh();
+  };
+
+  const findJobs = async () => {
+    setJobBusy(true);
+    setJobNote('Searching the web for matching jobs. This can take a few minutes…');
+    const res = await send('/v1/focus/jobs/search', 'POST').catch(() => null);
+    setJobBusy(false);
+    if (!res?.ok) { setJobNote(await errorDetail(res, 'The search did not finish.')); return; }
+    const out = await res.json() as { added: number; found: number };
+    setJobNote(out.added ? `Added ${out.added} new job${out.added === 1 ? '' : 's'} to your list.` : 'No new matching jobs this time.');
+    await refresh();
+  };
+
+  const addJobByLink = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!newJob.title.trim() || !newJob.url.trim()) return;
+    const res = await send('/v1/focus/jobs', 'POST', { ...newJob, title: newJob.title.trim(), url: newJob.url.trim() }).catch(() => null);
+    if (!res?.ok) { setJobNote(await errorDetail(res, 'That link was not accepted. It must start with https://')); return; }
+    setNewJob({ title: '', company: '', url: '' });
+    setJobNote('Job added.');
+    await refresh();
+  };
+
+  // Fill the search boxes from saved settings the first time they load.
+  const profileLoaded = useRef(false);
+  useEffect(() => {
+    if (!state || profileLoaded.current) return;
+    profileLoaded.current = true;
+    setJobTitles(state.job_profile.titles.join(', '));
+    setJobFloor(state.job_profile.min_salary ? String(state.job_profile.min_salary) : '');
+  }, [state]);
+
   const chooseCalendar = async (name: string) => {
     await send('/v1/focus/calendar', 'PUT', { write_to: name }).catch(() => null);
     await refresh();
@@ -1332,7 +1393,7 @@ export function FocusPage() {
                   ))}
                 </ul>
               ) : (
-                <p className="note" style={{ margin: 0 }}>No jobs waiting. Automatic job search is not connected yet.</p>
+                <p className="note" style={{ margin: 0 }}>No jobs waiting. Use “Find jobs now”, or add one yourself.</p>
               )}
               {state && !state.job_profile.has_resume && (
                 <p className="note" style={{ margin: '8px 0 0' }}>Resume not loaded yet, so drafts are off.</p>
@@ -1536,9 +1597,24 @@ export function FocusPage() {
         </section>
 
         <section className="card">
-          <h2><Mail size={20} /> Email</h2>
-          <p className="empty">Not connected yet.</p>
-          <p className="note">Gmail, Yahoo and Outlook will show here once they are linked. Nothing is read or sent today.</p>
+          <h2><Mail size={20} /> Email {mail && mail.unread > 0 && <span className="badge">{mail.unread}</span>}</h2>
+          {!mail?.available ? (
+            <p className="note">Mail can only be read on a Mac.</p>
+          ) : mail.error ? (
+            <p className="note late">{mail.error}</p>
+          ) : (
+            <>
+              <p className="note">{mail.unread} unread{mail.accounts.length ? ` across ${mail.accounts.length} account${mail.accounts.length === 1 ? '' : 's'}` : ''}</p>
+              <ul className="tlist scroll">
+                {mail.latest.slice(0, 5).map((m, k) => (
+                  <li key={`${k}-${m.date}`} className="trow">
+                    <span className="tmain"><span>{m.from.replace(/\s*<.*>/, '') || m.from}</span><small>{m.subject}</small></span>
+                  </li>
+                ))}
+              </ul>
+            </>
+          )}
+          <p className="note foot">Read live from the Mail app. Nothing is saved or changed.</p>
         </section>
 
         <section className="card">
@@ -1723,7 +1799,41 @@ export function FocusPage() {
           {section === 'spanish' && <div className="grid12"><div className="span8">{spanishPanel}</div></div>}
           {section === 'trading' && <div className="grid12"><div className="span6">{tradesPanel}</div><div className="span6">{goalPanel}</div></div>}
           {section === 'car' && <div className="grid12"><div className="span8">{goalPanel}</div></div>}
-          {section === 'jobs' && <div className="grid12"><div className="span12">{jobsPanel}</div></div>}
+          {section === 'jobs' && (
+            <div className="grid12">
+              <div className="span8">{jobsPanel}</div>
+              <div className="span4">
+                <div className="panel">
+                  <h2>Find jobs</h2>
+                  <label className="voicepick" style={{ padding: 0 }}>
+                    <small>{state?.job_profile.has_resume ? 'Resume loaded. Choose a file to replace it.' : 'Your resume (Word or text file)'}</small>
+                    <input id="focus-resume" type="file" accept=".docx,.txt,.md" onChange={(e) => void uploadResume(e.target.files?.[0])} />
+                  </label>
+                  <label className="voicepick" style={{ padding: '10px 0 0' }}>
+                    <small>Job titles to search for, separated by commas</small>
+                    <input id="focus-job-titles" value={jobTitles} onChange={(e) => setJobTitles(e.target.value)} placeholder="Process Improvement Manager, Change Manager" autoComplete="off" />
+                  </label>
+                  <label className="voicepick" style={{ padding: '10px 0 0' }}>
+                    <small>Lowest yearly pay to accept ($)</small>
+                    <input id="focus-job-floor" type="number" min="0" step="1000" value={jobFloor} onChange={(e) => setJobFloor(e.target.value)} placeholder="65000" />
+                  </label>
+                  <div className="row" style={{ marginTop: 10 }}>
+                    <button onClick={() => void saveJobProfile()}>Save</button>
+                    <button className="primary" onClick={() => void findJobs()} disabled={jobBusy || !online?.configured}>{jobBusy ? 'Searching…' : 'Find jobs now'}</button>
+                  </div>
+                  {!online?.configured && <p className="note" style={{ marginTop: 8 }}>Searching needs the online model key.</p>}
+                  {jobNote && <p className="note" style={{ marginTop: 8 }} aria-live="polite">{jobNote}</p>}
+                  <h2 style={{ marginTop: 16 }}>Add a job yourself</h2>
+                  <form className="voicepick" style={{ padding: 0 }} onSubmit={addJobByLink}>
+                    <input id="focus-newjob-title" value={newJob.title} onChange={(e) => setNewJob({ ...newJob, title: e.target.value })} placeholder="Job title" aria-label="Job title" autoComplete="off" />
+                    <input id="focus-newjob-company" value={newJob.company} onChange={(e) => setNewJob({ ...newJob, company: e.target.value })} placeholder="Company" aria-label="Company" autoComplete="off" />
+                    <input id="focus-newjob-url" value={newJob.url} onChange={(e) => setNewJob({ ...newJob, url: e.target.value })} placeholder="https://… link to the posting" aria-label="Link to the posting" autoComplete="off" />
+                    <button type="submit">Add to list</button>
+                  </form>
+                </div>
+              </div>
+            </div>
+          )}
           {section === 'calendar' && (
             <div className="grid12">
               <div className="span8">{tasksPanel}</div>
@@ -1758,7 +1868,27 @@ export function FocusPage() {
               </div>
             </div>
           )}
-          {section === 'email' && <div className="grid12"><div className="span8">{soon('Email', 'Gmail, Yahoo and Outlook are not connected yet, so nothing is read, sorted or sent.')}</div></div>}
+          {section === 'email' && (
+            <div className="grid12"><div className="span8">
+              <div className="panel">
+                <h2>Email <span>{mail?.available && !mail.error ? `${mail.unread} unread` : ''}</span></h2>
+                {!mail?.available ? <p className="note">Mail can only be read on a Mac.</p> : mail.error ? <p className="fb bad" style={{ textAlign: 'left' }}>{mail.error}</p> : (
+                  <>
+                    {mail.accounts.map((a) => <div className="kv" key={a.name}><span>{a.name}</span><span>{a.unread} unread</span></div>)}
+                    <ul style={{ marginTop: 10 }}>
+                      {mail.latest.map((m, k) => (
+                        <li key={`${k}-${m.date}`}>
+                          <span><b>{m.from.replace(/\s*<.*>/, '') || m.from}</b> · {m.subject}</span>
+                          <span className="m">{m.account}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+                <p className="note" style={{ marginTop: 10 }}>Read live from the Mac's Mail app. Nothing is saved, moved or deleted. Sorting and clean-up are not built yet.</p>
+              </div>
+            </div></div>
+          )}
           {section === 'business' && <div className="grid12"><div className="span8">{soon('Business builder', 'Not built yet. Ideas you capture are kept in Brain Dump, tagged “idea”.')}</div></div>}
         </main>
       </div>

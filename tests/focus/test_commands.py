@@ -4,6 +4,7 @@ import pytest
 
 from openjarvis.focus.commands import (
     extract_command,
+    from_model,
     interpret,
     interpret_pending,
     parse_when,
@@ -141,3 +142,25 @@ def test_follow_up_answers():
 def test_spanish_requests():
     for said in ("teach me Spanish", "I want to learn Spanish", "continue my Spanish"):
         assert interpret(said, NOW) == {"intent": "action", "action": "spanish"}
+
+
+def test_from_model_keeps_date_parsing_local():
+    plan = from_model(
+        {"intent": "task", "text": "call the bank", "when": "friday at 2 pm"}, NOW
+    )
+    assert (plan["title"], plan["due"]) == ("Call the bank", "2026-11-20T14:00")
+    assert from_model({"intent": "idea", "text": "candle shop"}, NOW)["kind"] == "idea"
+    assert (
+        from_model({"intent": "goal", "amount": "-20", "text": "MES"}, NOW)["amount"]
+        == -20
+    )
+    assert from_model({"intent": "goal", "text": "MES"}, NOW) == {"intent": "none"}
+    assert from_model({"intent": "spanish"}, NOW) == {
+        "intent": "action",
+        "action": "spanish",
+    }
+    assert (
+        from_model({"intent": "answer", "text": "Ninety-six."}, NOW)["text"]
+        == "Ninety-six."
+    )
+    assert from_model({"intent": "weird"}, NOW) == {"intent": "none"}
