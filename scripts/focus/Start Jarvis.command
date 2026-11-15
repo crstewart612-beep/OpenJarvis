@@ -4,6 +4,10 @@
 export PATH="$HOME/.local/bin:$PATH"
 export UV_HTTP_TIMEOUT=600
 
+echo "Checking for updates..."
+git -C "$HOME/.openjarvis/src" pull --ff-only --quiet 2>/dev/null \
+  || echo "(Could not check for updates; starting the version you have.)"
+
 echo "Stopping any earlier copy..."
 lsof -ti:5173 | xargs kill -9 2>/dev/null
 jarvis stop >/dev/null 2>&1

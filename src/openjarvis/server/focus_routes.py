@@ -387,6 +387,31 @@ async def _transcribe(request: Request, language: Optional[str]) -> str:
     return (result.text or "").strip()
 
 
+@focus_router.post("/listen/warm")
+async def warm_listening(request: Request):
+    """Start loading speech recognition in the background; report readiness."""
+    state = request.app.state
+    if getattr(state, "focus_stt_ready", False):
+        return {"ready": True}
+    task = getattr(state, "focus_stt_task", None)
+    if task is None or task.done():
+        try:
+            backend = _stt(request)
+        except Exception:
+            logger.exception("Speech recognition could not be created")
+            return {"ready": False, "error": "Speech recognition is not installed"}
+        health = getattr(backend, "health", None)
+        if health is None:
+            state.focus_stt_ready = True
+            return {"ready": True}
+
+        async def _load() -> None:
+            state.focus_stt_ready = bool(await asyncio.to_thread(health))
+
+        state.focus_stt_task = asyncio.create_task(_load())
+    return {"ready": False}
+
+
 @focus_router.post("/listen")
 async def listen(request: Request):
     """Turn a short recording into text. The audio is not kept."""

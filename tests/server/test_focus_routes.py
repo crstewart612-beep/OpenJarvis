@@ -257,3 +257,17 @@ def test_online_model_is_used_when_a_key_is_saved(client, monkeypatch):
     task = client.post("/v1/focus/task", json={"title": "Send invoice"}).json()
     assert task["steps"] == ["Open mail"]
     assert seen["model"].startswith("claude-")
+
+
+def test_warm_listening_reports_ready(client):
+    class Slow(_Stt):
+        def health(self):
+            return True
+
+    client.app.state.focus_stt = Slow("x")
+    first = client.post("/v1/focus/listen/warm").json()
+    assert first == {"ready": False}
+    for _ in range(50):
+        if client.post("/v1/focus/listen/warm").json()["ready"]:
+            break
+    assert client.post("/v1/focus/listen/warm").json() == {"ready": True}

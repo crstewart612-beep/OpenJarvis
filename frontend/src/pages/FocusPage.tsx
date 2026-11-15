@@ -48,30 +48,57 @@ const fmtDue = (iso: string) => {
   return `${d.toLocaleDateString([], { month: 'short', day: 'numeric' })}, ${time}`;
 };
 
-async function send(path: string, method: string, body?: unknown): Promise<Response> {
+async function send(path: string, method: string, body?: unknown, signal?: AbortSignal): Promise<Response> {
   return apiFetch(path, {
     method,
+    signal,
     headers: body ? { 'Content-Type': 'application/json' } : {},
     body: body ? JSON.stringify(body) : undefined,
   });
 }
 
-let audio: HTMLAudioElement | null = null;
-/** Speak text in one of the voices. Resolves when playback has finished. */
-async function speak(text: string, mode: 'calm' | 'deadline' | 'es'): Promise<void> {
+// Safari only lets a page make sound in direct response to a click, unless the
+// sound goes through an audio context that a click has already switched on.
+// So one shared context is switched on by the first click anywhere on the page
+// and every spoken line is played through it.
+let out: AudioContext | null = null;
+let playing: AudioBufferSourceNode | null = null;
+
+function unlockAudio(): void {
   try {
-    const res = await send('/v1/focus/speak', 'POST', { text, mode });
-    if (!res.ok) return;
-    const url = URL.createObjectURL(await res.blob());
-    audio?.pause();
-    const player = new Audio(url);
-    audio = player;
+    if (!out) {
+      const Ctx: typeof AudioContext = window.AudioContext
+        ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      out = new Ctx();
+    }
+    if (out.state === 'suspended') void out.resume();
+  } catch {
+    out = null;
+  }
+}
+
+function stopSpeaking(): void {
+  try { playing?.stop(); } catch { /* already stopped */ }
+  playing = null;
+}
+
+/** Speak text in one of the voices. Resolves when playback has finished. */
+async function speak(text: string, mode: 'calm' | 'deadline' | 'es', signal?: AbortSignal): Promise<void> {
+  try {
+    const res = await send('/v1/focus/speak', 'POST', { text, mode }, signal);
+    if (!res.ok || !out) return;
+    const buffer = await out.decodeAudioData(await res.arrayBuffer());
+    if (signal?.aborted) return;
+    if (out.state === 'suspended') await out.resume();
+    stopSpeaking();
+    const node = out.createBufferSource();
+    node.buffer = buffer;
+    node.connect(out.destination);
+    playing = node;
     await new Promise<void>((resolve) => {
-      const finish = () => { URL.revokeObjectURL(url); resolve(); };
-      player.onended = finish;
-      player.onerror = finish;
-      player.onpause = finish;
-      player.play().catch(finish);
+      node.onended = () => { if (playing === node) playing = null; resolve(); };
+      signal?.addEventListener('abort', () => { try { node.stop(); } catch { resolve(); } }, { once: true });
+      node.start();
     });
   } catch {
     // Voice is optional: the screen still shows the same words.
@@ -191,6 +218,9 @@ export function FocusPage() {
   const [turns, setTurns] = useState<TalkTurn[]>([]);
   const [micBusy, setMicBusy] = useState(false);
   const talkRef = useRef(false);
+  const talkAbort = useRef<AbortController | null>(null);
+  const [sttReady, setSttReady] = useState(false);
+  const sttReadyRef = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const leftRef = useRef(left);
@@ -225,7 +255,30 @@ export function FocusPage() {
     return () => { clearInterval(poll); clearInterval(clock); };
   }, [refresh]);
 
-  useEffect(() => () => { talkRef.current = false; closeMic(); }, []);
+  useEffect(() => {
+    window.addEventListener('pointerdown', unlockAudio);
+    window.addEventListener('keydown', unlockAudio);
+    return () => {
+      window.removeEventListener('pointerdown', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+      talkRef.current = false;
+      talkAbort.current?.abort();
+      closeMic();
+    };
+  }, []);
+
+  // Load speech recognition in the background so the first spoken answer is not a long wait.
+  useEffect(() => {
+    let stop = false;
+    const check = async () => {
+      if (stop || sttReadyRef.current) return;
+      const res = await send('/v1/focus/listen/warm', 'POST').catch(() => null);
+      if (res?.ok && (await res.json()).ready) { sttReadyRef.current = true; setSttReady(true); return; }
+      setTimeout(check, 5000);
+    };
+    void check();
+    return () => { stop = true; };
+  }, []);
 
   // Sprint countdown.
   useEffect(() => {
@@ -424,6 +477,7 @@ export function FocusPage() {
   const sayCard = async () => {
     const card = lesson?.card;
     if (!card || micBusy || talking) return;
+    unlockAudio();
     setMicBusy(true);
     setFeedback({ ok: true, text: 'Listening… say it now.' });
     try {
@@ -450,13 +504,15 @@ export function FocusPage() {
 
   // Hands-free conversation: Jarvis speaks, listens, corrects, and repeats.
   const runTalk = async () => {
+    const abort = new AbortController();
+    talkAbort.current = abort;
     let history: TalkTurn[] = [];
     const push = (turn: TalkTurn) => { history = [...history, turn].slice(-12); setTurns(history); };
     const converse = async (text: string) => {
       setTalkStatus('Thinking…');
       const res = await send('/v1/focus/spanish/converse', 'POST', {
         text, history: history.map(({ role, text: t }) => ({ role, text: t })),
-      }).catch(() => null);
+      }, abort.signal).catch(() => null);
       if (!res?.ok) throw new Error(await errorDetail(res, 'The tutor could not answer.'));
       return res.json() as Promise<{ say: string; meaning: string; correction: string; progress: SpanishProgress }>;
     };
@@ -469,16 +525,16 @@ export function FocusPage() {
         push({ role: 'tutor', text: reply.say, meaning: reply.meaning });
         setLesson((cur) => (cur ? { ...cur, progress: reply.progress } : cur));
         setTalkStatus('Speaking…');
-        if (said && reply.correction) await speak(reply.correction, 'calm');
+        if (said && reply.correction) await speak(reply.correction, 'calm', abort.signal);
         if (!talkRef.current) break;
-        await speak(reply.say, 'es');
+        await speak(reply.say, 'es', abort.signal);
         said = '';
         while (talkRef.current && !said) {
           setTalkStatus('Listening… your turn.');
           const rec = await recordUtterance({ waitMs: 20000, silenceMs: 1100, maxMs: 15000, cancelled: () => !talkRef.current });
           if (!rec) continue;
           setTalkStatus('Working out what you said…');
-          const res = await apiFetch('/v1/focus/listen', { method: 'POST', body: audioForm(rec) }).catch(() => null);
+          const res = await apiFetch('/v1/focus/listen', { method: 'POST', body: audioForm(rec), signal: abort.signal }).catch(() => null);
           if (!res?.ok) throw new Error(await errorDetail(res, 'I could not hear that.'));
           said = ((await res.json()).text as string).trim();
         }
@@ -487,7 +543,7 @@ export function FocusPage() {
       }
       setTalkStatus('');
     } catch (err) {
-      setTalkStatus(err instanceof Error ? err.message : 'The conversation stopped.');
+      setTalkStatus(abort.signal.aborted ? '' : err instanceof Error ? err.message : 'The conversation stopped.');
     } finally {
       talkRef.current = false;
       setTalking(false);
@@ -496,7 +552,8 @@ export function FocusPage() {
   };
 
   const toggleTalk = () => {
-    if (talking) { talkRef.current = false; audio?.pause(); setTalkStatus('Stopping…'); return; }
+    if (talking) { talkRef.current = false; talkAbort.current?.abort(); stopSpeaking(); setTalkStatus(''); return; }
+    unlockAudio();
     talkRef.current = true;
     setTalking(true);
     setTurns([]);
@@ -635,7 +692,7 @@ export function FocusPage() {
                       )}
                       <div className="row" style={{ justifyContent: 'center' }}>
                         {lesson.card.kind !== 'type' && <button className="small" onClick={() => void speak(lesson.card!.es, 'es')}>Hear it</button>}
-                        {lesson.card.kind !== 'choose' && <button className="small" onClick={() => void sayCard()} disabled={micBusy || talking}>{micBusy ? 'Listening…' : 'Say it'}</button>}
+                        {lesson.card.kind !== 'choose' && <button className="small" onClick={() => void sayCard()} disabled={micBusy || talking || !sttReady}>{micBusy ? 'Listening…' : 'Say it'}</button>}
                         {lesson.card.kind === 'intro' && <button className="small primary" onClick={() => void spanishAnswer('seen')}>Got it</button>}
                         <button className="small" onClick={() => void spanishAnswer('skip')}>I know this</button>
                         <button className="small" onClick={() => void spanishAnswer('skip_unit')}>Skip unit</button>
@@ -646,7 +703,8 @@ export function FocusPage() {
                   )}
                   {feedback && <p className={feedback.ok ? 'fb ok' : 'fb bad'} aria-live="polite">{feedback.text}</p>}
                   <div className="talk">
-                    <button className={talking ? 'primary' : ''} onClick={toggleTalk} disabled={micBusy}>{talking ? 'Stop talking' : 'Talk with Jarvis'}</button>
+                    <button className={talking ? 'primary' : ''} onClick={toggleTalk} disabled={micBusy || (!sttReady && !talking)}>{talking ? 'Stop talking' : 'Talk with Jarvis'}</button>
+                    {!sttReady && <p className="note">Speech recognition is loading. The first time can take several minutes.</p>}
                     {talkStatus && <p className="note" aria-live="polite">{talkStatus}</p>}
                     {turns.length > 0 && (
                       <ul className="turns">
