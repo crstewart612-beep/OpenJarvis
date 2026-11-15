@@ -3,23 +3,42 @@
 [ -f ~/.zshrc ] && source ~/.zshrc
 export PATH="$HOME/.local/bin:$PATH"
 export UV_HTTP_TIMEOUT=600
+PORT=5173
 
 echo "Checking for updates..."
 git -C "$HOME/.openjarvis/src" pull --ff-only --quiet 2>/dev/null \
   || echo "(Could not check for updates; starting the version you have.)"
 
 echo "Stopping any earlier copy..."
-lsof -ti:5173 | xargs kill -9 2>/dev/null
+# Only the program serving the page, not browsers that are connected to it.
+lsof -ti "tcp:$PORT" -sTCP:LISTEN | xargs kill -9 2>/dev/null
 jarvis stop >/dev/null 2>&1
-sleep 2
+
+# After the old copy is stopped the system keeps its address reserved for a
+# short while if a browser tab was still connected. Wait until it is free.
+port_free() {
+  /usr/bin/python3 -c "import socket; socket.socket().bind(('127.0.0.1', $PORT))" 2>/dev/null
+}
+if [ -x /usr/bin/python3 ]; then
+  waited=0
+  until port_free || [ $waited -ge 90 ]; do
+    [ $waited -eq 0 ] && echo "Waiting for the old copy to let go (up to a minute)..."
+    sleep 3
+    waited=$((waited + 3))
+  done
+else
+  sleep 45
+fi
 
 # Open the Focus page as soon as the screen is being served.
 (
-  until curl -s -o /dev/null http://127.0.0.1:5173; do sleep 2; done
-  open "http://127.0.0.1:5173/focus"
+  until curl -s -o /dev/null "http://127.0.0.1:$PORT"; do sleep 2; done
+  open "http://127.0.0.1:$PORT/focus"
 ) &
+opener=$!
 
 echo "Starting Jarvis. The Focus page opens by itself when it is ready."
 jarvis gui --no-browser
+kill $opener 2>/dev/null
 echo
 echo "Jarvis has stopped. Close this window and double-click Start Jarvis again."
