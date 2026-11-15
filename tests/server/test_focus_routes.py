@@ -271,3 +271,22 @@ def test_warm_listening_reports_ready(client):
         if client.post("/v1/focus/listen/warm").json()["ready"]:
             break
     assert client.post("/v1/focus/listen/warm").json() == {"ready": True}
+
+
+def test_goal_tracks_trade_results(client):
+    goal = client.get("/v1/focus/state").json()["goal"]
+    assert goal["target"] == 10000 and goal["saved"] == 0
+    win = client.post(
+        "/v1/focus/goal/entry", json={"amount": 45.5, "note": "MES long"}
+    ).json()
+    client.post("/v1/focus/goal/entry", json={"amount": -20})
+    goal = client.get("/v1/focus/state").json()["goal"]
+    assert goal["saved"] == 25.5
+    assert [e["amount"] for e in goal["entries"]] == [-20, 45.5]
+    client.put("/v1/focus/goal", json={"target": 12000, "name": "New car"})
+    goal = client.get("/v1/focus/state").json()["goal"]
+    assert goal["target"] == 12000 and goal["name"] == "New car"
+    assert client.delete(f"/v1/focus/goal/entry/{win['id']}").status_code == 200
+    assert client.get("/v1/focus/state").json()["goal"]["saved"] == -20
+    assert client.post("/v1/focus/goal/entry", json={"amount": 0}).status_code == 400
+    assert client.put("/v1/focus/goal", json={"target": -5}).status_code == 422

@@ -15,11 +15,14 @@ interface FocusTask {
 interface FocusCapture { id: string; text: string; at: string }
 interface FocusSignal { id: string; symbol: string; action: 'long' | 'short' | 'exit' | 'wait'; say: string; at: string }
 interface FocusJob { id: string; title: string; company: string; url: string; salary: string; status: 'found' | 'drafted' | 'submitted' | 'skipped'; draft: string }
+interface GoalEntry { id: string; amount: number; note: string; at: string }
+interface FocusGoal { name: string; target: number; saved: number; entries: GoalEntry[] }
 interface FocusState {
   tasks: FocusTask[];
   captures: FocusCapture[];
   signals: FocusSignal[];
   jobs: FocusJob[];
+  goal: FocusGoal;
   job_profile: { titles: string[]; min_salary: number; has_resume: boolean };
   current: FocusTask | null;
   mode: 'calm' | 'deadline';
@@ -36,6 +39,8 @@ interface SizingRow { symbol: string; point_value: number; max_stop_points: numb
 const SPRINT_SECONDS = 15 * 60;
 const CALM_LINE = "Take a breath. One thing at a time. I'm right here with you.";
 
+const money = (n: number) =>
+  `${n < 0 ? '-' : ''}$${Math.abs(n).toLocaleString(undefined, { minimumFractionDigits: n % 1 ? 2 : 0, maximumFractionDigits: 2 })}`;
 const fmtTimer = (s: number) =>
   `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 const localDate = (d: Date) =>
@@ -219,6 +224,12 @@ export function FocusPage() {
   const [micBusy, setMicBusy] = useState(false);
   const talkRef = useRef(false);
   const talkAbort = useRef<AbortController | null>(null);
+  const [goalAmount, setGoalAmount] = useState('');
+  const [goalNote, setGoalNote] = useState('');
+  const [autoListen, setAutoListen] = useState(() => {
+    try { return localStorage.getItem('focus-auto-listen') === '1'; } catch { return false; }
+  });
+  const autoStarted = useRef(false);
   const [sttReady, setSttReady] = useState(false);
   const sttReadyRef = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -551,13 +562,62 @@ export function FocusPage() {
     }
   };
 
-  const toggleTalk = () => {
-    if (talking) { talkRef.current = false; talkAbort.current?.abort(); stopSpeaking(); setTalkStatus(''); return; }
+  const startTalk = () => {
+    if (talkRef.current) return;
     unlockAudio();
     talkRef.current = true;
     setTalking(true);
     setTurns([]);
     void runTalk();
+  };
+
+  const toggleTalk = () => {
+    if (talking) { talkRef.current = false; talkAbort.current?.abort(); stopSpeaking(); setTalkStatus(''); return; }
+    startTalk();
+  };
+
+  const changeAutoListen = (on: boolean) => {
+    setAutoListen(on);
+    try { localStorage.setItem('focus-auto-listen', on ? '1' : '0'); } catch { /* not remembered */ }
+  };
+
+  // With auto-listen on, start the conversation as soon as speech recognition
+  // is ready. Browsers stay silent until the page has been clicked once, so if
+  // sound is still locked the conversation starts on the first click instead.
+  useEffect(() => {
+    if (!autoListen || !sttReady || autoStarted.current) return;
+    const begin = () => {
+      if (autoStarted.current) return;
+      autoStarted.current = true;
+      window.removeEventListener('pointerdown', begin);
+      window.removeEventListener('keydown', begin);
+      startTalk();
+    };
+    unlockAudio();
+    if (out?.state === 'running') { begin(); return; }
+    setTalkStatus('Click anywhere once and I will start listening.');
+    window.addEventListener('pointerdown', begin);
+    window.addEventListener('keydown', begin);
+    return () => {
+      window.removeEventListener('pointerdown', begin);
+      window.removeEventListener('keydown', begin);
+    };
+  }, [autoListen, sttReady]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const saveGoal = async (patch: { name?: string; target?: number }) => {
+    await send('/v1/focus/goal', 'PUT', patch).catch(() => null);
+    await refresh();
+  };
+
+  const addGoalEntry = async (e: FormEvent) => {
+    e.preventDefault();
+    const amount = Number(goalAmount);
+    if (!goalAmount.trim() || !Number.isFinite(amount) || amount === 0) return;
+    const res = await send('/v1/focus/goal/entry', 'POST', { amount, note: goalNote.trim() }).catch(() => null);
+    if (!res?.ok) { setSay('I could not record that amount.'); return; }
+    setGoalAmount(''); setGoalNote('');
+    setSay(amount > 0 ? `${money(amount)} closer to your goal.` : `Recorded ${money(amount)}. It counts against the goal.`);
+    await refresh();
   };
 
   const toggleSprint = () => {
@@ -624,7 +684,42 @@ export function FocusPage() {
                 ))}
               </ul>
             </div>
+            {state && (
+              <div className="panel">
+                <h2>Goal <span>{Math.max(0, Math.min(100, Math.round((state.goal.saved / state.goal.target) * 100)))}%</span></h2>
+                <div className="kv">
+                  <input id="focus-goal-name" key={`n-${state.goal.name}`} defaultValue={state.goal.name} aria-label="Goal name"
+                    onBlur={(e) => { const v = e.target.value.trim(); if (v && v !== state.goal.name) void saveGoal({ name: v }); }} style={{ width: 'auto', flex: 1, textAlign: 'left' }} />
+                  <span>
+                    $ <input id="focus-goal-target" type="number" min="1" step="100" key={`t-${state.goal.target}`} defaultValue={state.goal.target} aria-label="Goal amount in dollars"
+                      onBlur={(e) => { const v = Number(e.target.value); if (v > 0 && v !== state.goal.target) void saveGoal({ target: v }); }} />
+                  </span>
+                </div>
+                <div className="goal-amount"><b className={state.goal.saved < 0 ? 'late' : ''}>{money(state.goal.saved)}</b> of {money(state.goal.target)}</div>
+                <div className="bar-track" role="progressbar" aria-valuemin={0} aria-valuemax={state.goal.target} aria-valuenow={Math.max(0, state.goal.saved)}>
+                  <div className="bar-fill" style={{ width: `${Math.max(0, Math.min(100, (state.goal.saved / state.goal.target) * 100))}%` }} />
+                </div>
+                <form className="row" onSubmit={addGoalEntry} style={{ marginTop: 10 }}>
+                  <input id="focus-goal-amount" type="number" step="0.01" value={goalAmount} onChange={(e) => setGoalAmount(e.target.value)} placeholder="Trade result, e.g. 45 or -20" aria-label="Trade result in dollars" />
+                  <input id="focus-goal-note" value={goalNote} onChange={(e) => setGoalNote(e.target.value)} placeholder="Note (optional)" aria-label="Note" autoComplete="off" />
+                  <button type="submit">Record</button>
+                </form>
+                <ul style={{ marginTop: 10 }}>
+                  {state.goal.entries.slice(0, 5).map((g) => (
+                    <li key={g.id}>
+                      <span><b className={g.amount < 0 ? 'late' : 'gain'}>{g.amount > 0 ? '+' : ''}{money(g.amount)}</b>{g.note ? ` · ${g.note}` : ''}</span>
+                      <span className="end">
+                        <span className="m">{g.at.slice(5, 10)}</span>
+                        <button className="small" onClick={() => void remove(`/v1/focus/goal/entry/${g.id}`)} aria-label="Remove entry">×</button>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+                <p className="note" style={{ margin: '8px 0 0' }}>Enter each trade's profit, or a loss as a minus number.</p>
+              </div>
+            )}
           </div>
+
 
           <div className="col mid">
             <div className="panel core">
@@ -705,6 +800,7 @@ export function FocusPage() {
                   <div className="talk">
                     <button className={talking ? 'primary' : ''} onClick={toggleTalk} disabled={micBusy || (!sttReady && !talking)}>{talking ? 'Stop talking' : 'Talk with Jarvis'}</button>
                     {!sttReady && <p className="note">Speech recognition is loading. The first time can take several minutes.</p>}
+                    <label className="check"><input id="focus-auto-listen" type="checkbox" checked={autoListen} onChange={(e) => changeAutoListen(e.target.checked)} /> Start listening when this page opens</label>
                     {talkStatus && <p className="note" aria-live="polite">{talkStatus}</p>}
                     {turns.length > 0 && (
                       <ul className="turns">

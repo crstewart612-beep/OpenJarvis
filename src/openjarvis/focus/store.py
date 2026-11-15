@@ -42,6 +42,7 @@ class FocusStore:
         data.setdefault("captures", [])
         data.setdefault("signals", [])
         data.setdefault("jobs", [])
+        data.setdefault("goal", {"name": "Car", "target": 10000.0, "entries": []})
         data.setdefault("job_profile", {"titles": [], "min_salary": 0, "resume": ""})
         data.setdefault("risk_per_trade", DEFAULT_RISK_PER_TRADE)
         return data
@@ -62,6 +63,8 @@ class FocusStore:
         data.pop("sections", None)
         profile = data["job_profile"]
         profile["has_resume"] = bool(profile.pop("resume", ""))
+        goal = data["goal"]
+        goal["saved"] = round(sum(e["amount"] for e in goal["entries"]), 2)
         open_tasks = [t for t in data["tasks"] if not t["done"]]
         open_tasks.sort(key=lambda t: (not t["overdue"], t.get("due") or "9999"))
         data["current"] = open_tasks[0] if open_tasks else None
@@ -162,6 +165,46 @@ class FocusStore:
                     self._save(data)
                     return job
         return None
+
+    def set_goal(
+        self, name: Optional[str] = None, target: Optional[float] = None
+    ) -> Dict[str, Any]:
+        with self._lock:
+            data = self._load()
+            if name is not None:
+                data["goal"]["name"] = name
+            if target is not None:
+                data["goal"]["target"] = target
+            self._save(data)
+            return data["goal"]
+
+    def add_goal_entry(
+        self, amount: float, note: str = "", now: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """Record money toward the goal. A loss is a negative amount."""
+        now = now or datetime.now()
+        entry = {
+            "id": _new_id(),
+            "amount": round(amount, 2),
+            "note": note,
+            "at": now.isoformat(timespec="minutes"),
+        }
+        with self._lock:
+            data = self._load()
+            data["goal"]["entries"].insert(0, entry)
+            self._save(data)
+        return entry
+
+    def remove_goal_entry(self, entry_id: str) -> bool:
+        with self._lock:
+            data = self._load()
+            entries = data["goal"]["entries"]
+            kept = [e for e in entries if e["id"] != entry_id]
+            if len(kept) == len(entries):
+                return False
+            data["goal"]["entries"] = kept
+            self._save(data)
+        return True
 
     def section(self, key: str) -> Optional[Dict[str, Any]]:
         """A named sub-state kept out of the main snapshot (e.g. lessons)."""

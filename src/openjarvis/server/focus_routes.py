@@ -98,6 +98,16 @@ class ConverseBody(BaseModel):
     history: List[ConverseTurn] = Field(default_factory=list, max_length=12)
 
 
+class GoalBody(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=60)
+    target: Optional[float] = Field(default=None, gt=0, le=1_000_000_000)
+
+
+class GoalEntryBody(BaseModel):
+    amount: float = Field(ge=-1_000_000, le=1_000_000)
+    note: str = Field(default="", max_length=120)
+
+
 class SpeakBody(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     mode: str = "calm"
@@ -229,6 +239,26 @@ async def delete_capture(request: Request, capture_id: str):
 @focus_router.put("/risk")
 async def set_risk(request: Request, body: RiskBody):
     return {"risk_per_trade": _store(request).set_risk(body.risk_per_trade)}
+
+
+@focus_router.put("/goal")
+async def set_goal(request: Request, body: GoalBody):
+    name = body.name.strip() if body.name else None
+    return _store(request).set_goal(name=name or None, target=body.target)
+
+
+@focus_router.post("/goal/entry")
+async def add_goal_entry(request: Request, body: GoalEntryBody):
+    if body.amount == 0:
+        raise HTTPException(status_code=400, detail="Enter an amount other than 0")
+    return _store(request).add_goal_entry(body.amount, body.note.strip())
+
+
+@focus_router.delete("/goal/entry/{entry_id}")
+async def delete_goal_entry(request: Request, entry_id: str):
+    if not _store(request).remove_goal_entry(entry_id):
+        raise HTTPException(status_code=404, detail="Entry not found")
+    return {"ok": True}
 
 
 @focus_router.get("/sizing")
