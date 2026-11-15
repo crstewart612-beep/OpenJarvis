@@ -13,7 +13,9 @@ from typing import Any, Dict, Optional, Tuple
 
 # Speech recognition does not always spell the name the same way.
 _WAKE = re.compile(
-    r"\b(?:hey|hi|ok|okay|a|eh)?[\s,]*(jarvis|jervis|jarvus|jarvas|jarves|garvis)\b[\s,.!?:]*",
+    r"\b(?:hey|hi|ok|okay|a|eh)?[\s,]*"
+    r"(morpheus|morfeus|morphius|morfius|morpheous|morphis|morfis|"
+    r"jarvis|jervis|jarvus|jarvas|jarves|garvis)\b[\s,.!?:]*",
     re.IGNORECASE,
 )
 

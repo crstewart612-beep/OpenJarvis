@@ -18,6 +18,8 @@ NOW = datetime(2026, 11, 15, 10, 0)  # a Sunday
         ("Hey Jarvis, add milk to my list.", "add milk to my list."),
         ("hey jervis start a sprint", "start a sprint"),
         ("Jarvis.", ""),
+        ("Hey Morpheus, add milk to my list.", "add milk to my list."),
+        ("hey morfius start a sprint", "start a sprint"),
         ("OK, so, hey Jarvis: remind me to call mom", "remind me to call mom"),
         ("I was talking about the weather", None),
     ],

@@ -37,7 +37,21 @@ interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 17';
+const BUILD = 'build 18';
+// What the assistant is called on screen and out loud.
+const NAME = 'Morpheus';
+const NAV: [string, string][] = [
+  ['overview', '⌂ Overview'],
+  ['tasks', '✓ Tasks'],
+  ['ideas', '✦ Brain dump'],
+  ['spanish', '◉ Spanish'],
+  ['trading', '▥ Trading'],
+  ['car', '◈ Car fund'],
+  ['jobs', '▣ Job hunt'],
+  ['calendar', '▤ Calendar'],
+  ['email', '✉ Email'],
+  ['business', '◇ Business builder'],
+];
 const SPRINT_SECONDS = 15 * 60;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CALM_LINE = "Take a breath. One thing at a time. I'm right here with you.";
@@ -97,7 +111,7 @@ function stopSpeaking(): void {
   playing = null;
 }
 
-// Lines Jarvis says often ("Correct.", "What does that mean?") are kept after
+// Lines Morpheus says often ("Correct.", "What does that mean?") are kept after
 // the first time so they play at once instead of being generated again.
 const spoken = new Map<string, AudioBuffer>();
 // Why the last line could not be spoken, for showing on screen.
@@ -140,7 +154,7 @@ async function speak(text: string, mode: 'calm' | 'deadline' | 'es', signal?: Ab
   }
 }
 
-/** A short tone: instant feedback that Jarvis heard its name or is listening. */
+/** A short tone: instant feedback that Morpheus heard its name or is listening. */
 function chime(freq = 880): void {
   try {
     if (!out || out.state !== 'running') return;
@@ -241,7 +255,7 @@ function audioForm(rec: Recording, fields: Record<string, string> = {}): FormDat
 }
 
 async function errorDetail(res: Response | null, fallback: string): Promise<string> {
-  if (!res) return 'The Jarvis server did not answer.';
+  if (!res) return 'The server did not answer.';
   const body = await res.json().catch(() => ({}));
   return typeof body.detail === 'string' ? body.detail : fallback;
 }
@@ -277,6 +291,9 @@ export function FocusPage() {
   });
   const autoStarted = useRef(false);
   const [wake, setWake] = useState(false);
+  const [section, setSection] = useState('overview');
+  const [ask, setAsk] = useState('');
+  const askPending = useRef('');
   const [soundOff, setSoundOff] = useState(true);
   const [voiceProblem, setVoiceProblem] = useState('');
   const [wakeStatus, setWakeStatus] = useState('');
@@ -386,15 +403,16 @@ export function FocusPage() {
 
   // The orb.
   useEffect(() => {
-    const cv = canvasRef.current;
     const root = rootRef.current;
-    if (!cv || !root) return;
-    const cx = cv.getContext('2d');
-    if (!cx) return;
+    if (!root) return;
     const still = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     let frame = 0;
     let timer: ReturnType<typeof setInterval> | undefined;
     const draw = (ts: number) => {
+      // The orb is only on some sections, so look it up on every frame.
+      const cv = canvasRef.current;
+      const cx = cv?.getContext('2d');
+      if (!cv || !cx) { if (!still) frame = requestAnimationFrame(draw); return; }
       const css = getComputedStyle(root);
       const accent = css.getPropertyValue('--accent').trim();
       const line = css.getPropertyValue('--line').trim();
@@ -458,7 +476,7 @@ export function FocusPage() {
     if (due || (dueDate && dueDate !== today)) dueIso = `${dueDate || today}T${due || '23:59'}`;
     const res = await send('/v1/focus/task', 'POST', { title: t, due: dueIso }).catch(() => null);
     setAdding(false);
-    if (!res?.ok) { setSay('I could not save that task. Is the Jarvis server running?'); return; }
+    if (!res?.ok) { setSay('I could not save that task. Is the server running?'); return; }
     setTitle(''); setDue(''); setDueDate(localDate(new Date()));
     setSay('Added. Here is your first small step.');
     await refresh();
@@ -570,7 +588,7 @@ export function FocusPage() {
     }
   };
 
-  // Hands-free conversation: Jarvis speaks, listens, corrects, and repeats.
+  // Hands-free conversation: Morpheus speaks, listens, corrects, and repeats.
   const runTalk = async () => {
     const abort = new AbortController();
     talkAbort.current = abort;
@@ -619,7 +637,7 @@ export function FocusPage() {
     }
   };
 
-  // Voice lesson: Jarvis reads each card aloud and checks the spoken answer,
+  // Voice lesson: Morpheus reads each card aloud and checks the spoken answer,
   // following the same mastery rules as the buttons.
   const runLesson = async () => {
     const abort = new AbortController();
@@ -658,7 +676,7 @@ export function FocusPage() {
           if (!rec) {
             silent += 1;
             if (silent >= 3) {
-              await tell('I will pause the lesson. Say, hey Jarvis, teach me Spanish, when you are ready.');
+              await tell(`I will pause the lesson. Say, hey ${NAME}, teach me Spanish, when you are ready.`);
               talkRef.current = false;
               break;
             }
@@ -706,7 +724,7 @@ export function FocusPage() {
         if (next) { current = next; setLesson(next); }
       }
       setTalkStatus('');
-      // "Hey Jarvis, ..." said during the lesson: leave the lesson and do it.
+      // "Hey Morpheus, ..." said during the lesson: leave the lesson and do it.
       if (handOff) {
         const res = await send('/v1/focus/command', 'POST', { text: handOff }).catch(() => null);
         if (res?.ok) {
@@ -747,7 +765,7 @@ export function FocusPage() {
     try { localStorage.setItem('focus-auto-listen', on ? '1' : '0'); } catch { /* not remembered */ }
   };
 
-  // "Hey Jarvis": listen all the time, act only on speech that names Jarvis.
+  // "Hey Morpheus": listen all the time, act only on speech that names Morpheus.
   const runWake = async () => {
     let awakeUntil = 0;
     let pending = '';
@@ -757,7 +775,7 @@ export function FocusPage() {
         if (talkRef.current || busyRef.current) { await sleep(400); continue; }
         const awake = Date.now() < awakeUntil;
         if (!awake) pending = '';
-        setWakeStatus(awake ? 'Yes? Go ahead.' : 'Say "Hey Jarvis", then what you need.');
+        setWakeStatus(awake ? 'Yes? Go ahead.' : `Say "Hey ${NAME}", then what you need.`);
         const rec = await recordUtterance({
           waitMs: 30000, silenceMs: 900, maxMs: 12000,
           cancelled: () => !wakeRef.current || talkRef.current || busyRef.current,
@@ -810,7 +828,7 @@ export function FocusPage() {
     startWake();
   };
 
-  // With the box ticked, start listening for "Hey Jarvis" as soon as speech
+  // With the box ticked, start listening for "Hey Morpheus" as soon as speech
   // recognition is ready. Browsers stay silent until the page has been clicked
   // once, so if sound is still locked it starts on the first click instead.
   useEffect(() => {
@@ -858,30 +876,30 @@ export function FocusPage() {
   actionsRef.current = {
     startSprint: () => { if (!running) toggleSprint(); },
     stepDone: () => { void stepDone(); },
-    startTalk: () => startTalk('lesson'),
+    startTalk: () => { setSection('spanish'); startTalk('lesson'); },
+  };
+
+  // The typed command box does what "Hey Morpheus" does, without the microphone.
+  const askTyped = async (e: FormEvent) => {
+    e.preventDefault();
+    const text = ask.trim();
+    if (!text) return;
+    setAsk('');
+    unlockAudio();
+    const res = await send('/v1/focus/command', 'POST', { text, awake: true, pending: askPending.current }).catch(() => null);
+    if (!res?.ok) { setSay('I could not reach the server.'); return; }
+    const out = await res.json() as { say?: string; action?: string | null; pending?: string };
+    askPending.current = out.pending || '';
+    if (out.say) { setSay(out.say); void speak(out.say, 'calm'); }
+    await refresh();
+    if (out.action === 'sprint') actionsRef.current.startSprint();
+    if (out.action === 'step_done') actionsRef.current.stepDone();
+    if (out.action === 'spanish') actionsRef.current.startTalk();
   };
 
   const status = running ? 'Focus sprint' : mode === 'deadline' ? 'Overdue' : left < SPRINT_SECONDS && left > 0 ? 'Paused' : 'Ready';
 
-  return (
-    <div className="focus-hud" data-mode={mode} ref={rootRef}>
-      <div className="wrap">
-        <div className="top">
-          <span className="brand">FOCUS HUD</span>
-          <span><span className={offline ? 'dot off' : 'dot'} />Jarvis server: <b>{offline ? 'not reachable' : 'connected'}</b></span>
-          <span>Tasks, notes and voice stay on this Mac · {BUILD}</span>
-          {soundOff && <span className="late">Sound is off: click anywhere on this page to turn it on</span>}
-          {voiceProblem && <span className="late">{voiceProblem}</span>}
-          <Link className="btn" to="/">Chat</Link>
-        </div>
-
-        <div className="grid">
-          <div className="col">
-            <div className="panel">
-              <h2>Now</h2>
-              <div className="clock">{now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</div>
-              <div className="date">{now.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })}</div>
-            </div>
+  const tasksPanel = (
             <div className="panel">
               <h2>To-dos <span>{state ? `${state.tasks.filter((t) => !t.done).length} open` : ''}</span></h2>
               <form className="row" onSubmit={addTask}>
@@ -903,6 +921,8 @@ export function FocusPage() {
               </ul>
               <p className="note" style={{ margin: '10px 0 0' }}>Outlook and Google calendars: not connected yet</p>
             </div>
+  );
+  const capturePanel = (
             <div className="panel">
               <h2>Quick capture <span>{state ? `${state.captures.length} caught` : ''}</span></h2>
               <form className="row" onSubmit={addCapture}>
@@ -921,7 +941,8 @@ export function FocusPage() {
                 ))}
               </ul>
             </div>
-            {state && (
+  );
+  const goalPanel = state && (
               <div className="panel">
                 <h2>Goal <span>{Math.max(0, Math.min(100, Math.round((state.goal.saved / state.goal.target) * 100)))}%</span></h2>
                 <div className="kv">
@@ -954,11 +975,8 @@ export function FocusPage() {
                 </ul>
                 <p className="note" style={{ margin: '8px 0 0' }}>Enter each trade's profit, or a loss as a minus number.</p>
               </div>
-            )}
-          </div>
-
-
-          <div className="col mid">
+            );
+  const corePanel = (
             <div className="panel core">
               <div className="orbbox">
                 <canvas ref={canvasRef} aria-hidden="true" />
@@ -967,10 +985,9 @@ export function FocusPage() {
                   <div className="state">{status}</div>
                 </div>
               </div>
-              <div className="say" aria-live="polite">{say}</div>
               <div>
                 <div className="now-label">Your one next step</div>
-                <p className="now">{current ? current.steps[current.step] : 'Nothing open. Add a to-do on the left.'}</p>
+                <p className="now">{current ? current.steps[current.step] : 'Nothing open. Add a to-do.'}</p>
                 {current && (
                   <div className="task">{current.title} (step {current.step + 1} of {current.steps.length})</div>
                 )}
@@ -986,16 +1003,9 @@ export function FocusPage() {
                 <button className="primary" onClick={toggleSprint}>{running ? 'Pause' : left < SPRINT_SECONDS && left > 0 ? 'Resume sprint' : 'Start 15-min sprint'}</button>
                 <button onClick={() => void stepDone()} disabled={!current}>Step done</button>
               </div>
-              <div className="wake">
-                <button className={wake ? 'primary' : ''} onClick={toggleWake} disabled={!sttReady && !wake}>{wake ? 'Hey Jarvis: on' : 'Hey Jarvis: off'}</button>
-                {wakeStatus && <p className="note" aria-live="polite">{wakeStatus}</p>}
-                {!sttReady && <p className="note">Speech recognition is loading.</p>}
-                <label className="check"><input id="focus-auto-listen" type="checkbox" checked={autoListen} onChange={(e) => changeAutoListen(e.target.checked)} /> Turn on when this page opens</label>
-              </div>
             </div>
-          </div>
-
-          <div className="col">
+  );
+  const spanishPanel = (
             <div className="panel">
               <h2>Spanish <span>{lesson ? `unit ${lesson.progress.unit_number} of ${lesson.progress.unit_count}` : ''}</span></h2>
               {lesson ? (
@@ -1055,7 +1065,7 @@ export function FocusPage() {
                       <ul className="turns">
                         {turns.slice(-4).map((t, i) => (
                           <li key={`${i}-${t.text}`} className={t.role}>
-                            <span><b>{t.role === 'you' ? 'You' : 'Jarvis'}:</b> {t.text}</span>
+                            <span><b>{t.role === 'you' ? 'You' : NAME}:</b> {t.text}</span>
                             {t.meaning && <span className="m">{t.meaning}</span>}
                             {t.correction && <span className="fix">{t.correction}</span>}
                           </li>
@@ -1068,6 +1078,8 @@ export function FocusPage() {
                 <p className="note" style={{ margin: 0 }}>Lesson not loaded.</p>
               )}
             </div>
+  );
+  const tradesPanel = (
             <div className="panel">
               <h2>Trades <span>you place every trade</span></h2>
               <div className="kv">
@@ -1102,6 +1114,8 @@ export function FocusPage() {
                 <p className="note" style={{ margin: 0 }}>No calls yet. Chart alerts are not connected.</p>
               )}
             </div>
+  );
+  const jobsPanel = (
             <div className="panel">
               <h2>Job hunt <span>{openJobs.length} to do · {sentJobs} sent</span></h2>
               {openJobs.length ? (
@@ -1127,13 +1141,115 @@ export function FocusPage() {
                 <p className="note" style={{ margin: '8px 0 0' }}>Resume not loaded yet, so drafts are off.</p>
               )}
             </div>
-            <div className="panel">
-              <h2>Inbox</h2>
-              <p className="note" style={{ margin: 0 }}>Gmail, Yahoo and Outlook: not connected yet</p>
-            </div>
+  );
+  const soon = (title: string, text: string) => (
+    <div className="panel">
+      <h2>{title}</h2>
+      <p className="note" style={{ margin: 0 }}>{text}</p>
+    </div>
+  );
+  const overdueCount = state?.tasks.filter((t) => t.overdue).length ?? 0;
+  const openCount = state?.tasks.filter((t) => !t.done).length ?? 0;
+
+  return (
+    <div className="focus-hud" data-mode={mode} ref={rootRef}>
+      <aside className="sidebar">
+        <div className="logo">◉ {NAME.toUpperCase()}</div>
+        <div className="sub">PERSONAL SYSTEM · ON THIS MAC</div>
+        <nav className="navlist">
+          {NAV.map(([key, label]) => (
+            <button key={key} className={section === key ? 'nav active' : 'nav'} onClick={() => setSection(key)}>{label}</button>
+          ))}
+          <Link className="nav" to="/settings">⚙ Settings</Link>
+          <Link className="nav" to="/">☰ Chat</Link>
+        </nav>
+        <p className="note">Tasks, notes and voice stay on this Mac. Nothing here places trades or sends email. {BUILD}</p>
+      </aside>
+
+      <main className="main">
+        <div className="top">
+          <div>
+            <div className="eyebrow">Personal intelligence system</div>
+            <h1>COMMAND CENTER</h1>
+            <div className="muted">{now.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })} · {now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</div>
+          </div>
+          <div className="topright">
+            <span><span className={offline ? 'dot off' : 'dot'} />{NAME} server: <b>{offline ? 'not reachable' : 'connected'}</b></span>
+            {soundOff && <span className="late">Sound is off: click anywhere on this page to turn it on</span>}
+            {voiceProblem && <span className="late">{voiceProblem}</span>}
           </div>
         </div>
-      </div>
+
+        <div className="hero-banner">
+          <div>
+            <div className="tag">Your partner for focus, growth and freedom</div>
+            <strong>Good to see you. We focus on the next right action.</strong>
+            <div className="small-action">One priority at a time</div>
+          </div>
+          <div>
+            <button className={overdueCount ? 'overdue-badge hot' : 'overdue-badge'} onClick={() => setSection('tasks')}>{overdueCount} overdue</button>
+            <span className="micro-tag">{openCount} open</span>
+          </div>
+        </div>
+
+        <div className="panel command">
+          <form className="row" onSubmit={askTyped}>
+            <input id="focus-ask" value={ask} onChange={(e) => setAsk(e.target.value)} placeholder={`Tell ${NAME} what you need… e.g. add pick up laundry tomorrow`} aria-label={`Message for ${NAME}`} autoComplete="off" />
+            <button className="primary" type="submit">Ask {NAME}</button>
+            <button type="button" className={wake ? 'primary' : ''} onClick={toggleWake} disabled={!sttReady && !wake}>{wake ? `🎙 Hey ${NAME}: on` : `🎙 Hey ${NAME}: off`}</button>
+          </form>
+          <p className="say" aria-live="polite">{say}</p>
+          <div className="wake">
+            {wakeStatus && <span className="note" aria-live="polite">{wakeStatus}</span>}
+            {!sttReady && <span className="note">Speech recognition is loading.</span>}
+            <label className="check"><input id="focus-auto-listen" type="checkbox" checked={autoListen} onChange={(e) => changeAutoListen(e.target.checked)} /> Listen for “Hey {NAME}” when this page opens</label>
+          </div>
+        </div>
+
+        {section === 'overview' && (
+          <div className="grid12">
+            <div className="span4">{corePanel}</div>
+            <div className="span4">{tasksPanel}</div>
+            <div className="span4">{goalPanel}</div>
+            <div className="span6">{spanishPanel}</div>
+            <div className="span6">{tradesPanel}</div>
+            <div className="span6">{capturePanel}</div>
+            <div className="span6">{jobsPanel}</div>
+          </div>
+        )}
+        {section === 'tasks' && (
+          <div className="grid12">
+            <div className="span8">{tasksPanel}</div>
+            <div className="span4">{corePanel}</div>
+          </div>
+        )}
+        {section === 'ideas' && <div className="grid12"><div className="span12">{capturePanel}</div></div>}
+        {section === 'spanish' && <div className="grid12"><div className="span8">{spanishPanel}</div></div>}
+        {section === 'trading' && (
+          <div className="grid12">
+            <div className="span6">{tradesPanel}</div>
+            <div className="span6">{goalPanel}</div>
+          </div>
+        )}
+        {section === 'car' && <div className="grid12"><div className="span8">{goalPanel}</div></div>}
+        {section === 'jobs' && <div className="grid12"><div className="span12">{jobsPanel}</div></div>}
+        {section === 'calendar' && (
+          <div className="grid12">
+            <div className="span8">{tasksPanel}</div>
+            <div className="span4">{soon('Calendar', 'Outlook and Google calendars are not connected yet. For now your dated to-dos are your calendar.')}</div>
+          </div>
+        )}
+        {section === 'email' && <div className="grid12"><div className="span8">{soon('Email', 'Gmail, Yahoo and Outlook are not connected yet, so nothing is read, sorted or sent.')}</div></div>}
+        {section === 'business' && <div className="grid12"><div className="span8">{soon('Business builder', 'Not built yet. Ideas you capture are kept in Brain dump, tagged “idea”.')}</div></div>}
+
+        <div className="status-strip">
+          <span>● SYSTEM <b>{offline ? 'Offline' : 'Ready'}</b></span>
+          <span>◉ FOCUS <b>{running ? 'Sprint running' : 'Available'}</b></span>
+          <span>✓ TASKS <b>{openCount} open</b></span>
+          <span>▣ JOB HUNT <b>{openJobs.length} to do</b></span>
+          <span>◈ {state?.goal.name ?? 'Goal'} <b>{state ? money(state.goal.saved) : ''}</b></span>
+        </div>
+      </main>
     </div>
   );
 }

@@ -511,10 +511,10 @@ async def warm_listening(request: Request):
 
 # Steers speech recognition toward the words commands are made of.
 _COMMAND_HINT = (
-    "Hey Jarvis, add this to my to-do list. Hey Jarvis, remind me tomorrow. "
-    "Hey Jarvis, add it to my brain dump. Hey Jarvis, teach me Spanish."
+    "Hey Morpheus, add this to my to-do list. Hey Morpheus, remind me tomorrow. "
+    "Hey Morpheus, add it to my brain dump. Hey Morpheus, teach me Spanish."
 )
-_LESSON_COMMAND_HINT = "Hey Jarvis. Skip. Stop. Say it again. I know this."
+_LESSON_COMMAND_HINT = "Hey Morpheus. Skip. Stop. Say it again. I know this."
 
 
 @focus_router.post("/listen")
@@ -672,7 +672,7 @@ async def spanish_converse(request: Request, body: ConverseBody):
 
 
 _ANSWER_PROMPT = (
-    "You are Jarvis, a calm voice assistant. Answer the question below in at "
+    "You are Morpheus, a calm voice assistant. Answer the question below in at "
     "most two short sentences of plain spoken English, with no lists or "
     "symbols. You cannot take actions, set reminders or change anything, so "
     "never say that you did or will.\n\nQuestion: {text}"
