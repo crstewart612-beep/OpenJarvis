@@ -42,7 +42,7 @@ interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 21';
+const BUILD = 'build 22';
 // What the assistant is called on screen and out loud.
 const NAME = 'Morpheus';
 const NAV: [string, string][] = [
@@ -373,6 +373,10 @@ export function FocusPage() {
   const [wake, setWake] = useState(false);
   const [section, setSection] = useState('overview');
   const [voice, setVoice] = useState(voiceChoice);
+  const [online, setOnline] = useState<{ configured: boolean; model: string } | null>(null);
+  const [keyOpen, setKeyOpen] = useState(false);
+  const [keyText, setKeyText] = useState('');
+  const [keyNote, setKeyNote] = useState('');
   const rainRef = useRef<HTMLCanvasElement>(null);
   const [taskTab, setTaskTab] = useState<'all' | 'today' | 'upcoming' | 'done'>('all');
   const [dumpText, setDumpText] = useState('');
@@ -971,6 +975,39 @@ export function FocusPage() {
     setGoalAmount(''); setGoalNote('');
     setSay(amount > 0 ? `${money(amount)} closer to your goal.` : `Recorded ${money(amount)}. It counts against the goal.`);
     await refresh();
+  };
+
+  // The online model's key is kept in a file on this computer by the local
+  // server. It is sent only to that server, and is never shown again.
+  const loadKeyStatus = useCallback(async () => {
+    const res = await send('/v1/focus/key', 'GET').catch(() => null);
+    if (res?.ok) setOnline(await res.json());
+  }, []);
+  useEffect(() => { void loadKeyStatus(); }, [loadKeyStatus]);
+
+  const testKey = async () => {
+    setKeyNote('Testing…');
+    const res = await send('/v1/focus/key/test', 'POST').catch(() => null);
+    const out = res?.ok ? await res.json() as { ok: boolean; model?: string; error?: string } : null;
+    setKeyNote(out?.ok ? `Working: ${out.model}` : out?.error || 'The test could not run.');
+  };
+
+  const saveKey = async (e: FormEvent) => {
+    e.preventDefault();
+    const key = keyText.trim();
+    if (!key) return;
+    setKeyNote('Saving…');
+    const res = await send('/v1/focus/key', 'PUT', { key }).catch(() => null);
+    setKeyText('');
+    if (!res?.ok) { setKeyNote(await errorDetail(res, 'The key could not be saved.')); return; }
+    setOnline(await res.json());
+    setKeyOpen(false);
+    await testKey();
+  };
+
+  const removeKey = async () => {
+    const res = await send('/v1/focus/key', 'PUT', { key: '' }).catch(() => null);
+    if (res?.ok) { setOnline(await res.json()); setKeyNote('Key removed.'); }
   };
 
   const chooseVoice = (next: string) => {
@@ -1607,7 +1644,27 @@ export function FocusPage() {
               {VOICES.map(([id, label]) => <option key={id} value={id}>{label}</option>)}
             </select>
           </label>
-          <p className="note">Everything here stays on this Mac. {BUILD}</p>
+          <div className="keybox">
+            <small>Online model</small>
+            <span className="keyline"><i className={online?.configured ? 'led on' : 'led'} /> {online?.configured ? 'Key saved' : 'No key yet'}</span>
+            {keyOpen ? (
+              <form onSubmit={saveKey}>
+                <input id="focus-key" type="password" value={keyText} onChange={(e) => setKeyText(e.target.value)} placeholder="sk-ant-…" aria-label="Anthropic API key" autoComplete="off" spellCheck={false} />
+                <div className="row">
+                  <button className="small primary" type="submit">Save</button>
+                  <button className="small" type="button" onClick={() => { setKeyOpen(false); setKeyText(''); }}>Cancel</button>
+                </div>
+              </form>
+            ) : (
+              <div className="row">
+                <button className="small" onClick={() => { setKeyOpen(true); setKeyNote(''); }}>{online?.configured ? 'Replace key' : 'Add key'}</button>
+                {online?.configured && <button className="small" onClick={() => void testKey()}>Test</button>}
+                {online?.configured && <button className="small" onClick={() => void removeKey()}>Remove</button>}
+              </div>
+            )}
+            {keyNote && <small aria-live="polite">{keyNote}</small>}
+          </div>
+          <p className="note">Tasks, notes and voice stay on this Mac. {BUILD}</p>
           <svg className="chair" viewBox="0 0 260 240" aria-hidden="true">
             <defs>
               <radialGradient id="leather" cx="45%" cy="30%" r="80%">

@@ -517,6 +517,9 @@ def gui(frontend_port: int, api_port: int, no_server: bool, no_browser: bool) ->
                 # Voice output (Kokoro) for the Focus HUD's spoken prompts.
                 "--extra",
                 "voice",
+                # Official SDK for the optional online model.
+                "--extra",
+                "inference-cloud",
                 "jarvis",
                 "start",
                 "--port",

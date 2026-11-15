@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 focus_router = APIRouter(prefix="/v1/focus", tags=["focus"])
 
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
+
 # Two original Kokoro voices: a slow, low one by default and a brisk, firm
 # one once a deadline has passed.
 VOICE_MODES = {
@@ -118,6 +120,10 @@ class CommandBody(BaseModel):
     pending: str = Field(default="", max_length=300)
 
 
+class KeyBody(BaseModel):
+    key: str = Field(default="", max_length=400)
+
+
 class SpeakBody(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     mode: str = "calm"
@@ -154,13 +160,46 @@ def parse_steps(text: str) -> List[str]:
     return [ln for ln in lines if re.search(r"[A-Za-z]{2}", ln)][:8]
 
 
-# Online model used when an Anthropic key is saved in the app's Cloud Models
-# settings. Without a key the local model answers instead.
-CLOUD_MODEL = os.environ.get("OPENJARVIS_FOCUS_MODEL", "claude-haiku-5-5")
+# Online model, used when an Anthropic key is saved on this computer. Without a
+# key the local model answers instead.
+CLOUD_MODEL = os.environ.get("OPENJARVIS_FOCUS_MODEL", "claude-opus-5-5")
+# Models that accept a server-side fallback when a request is declined.
+_FALLBACK_MODELS = ("claude-opus-5", "claude-sonnet-5-5", "claude-fable-5")
 
 
 class NoModelError(RuntimeError):
     """Neither an online key nor a local model is available."""
+
+
+def _api_key() -> str:
+    from openjarvis.server import cloud_router
+
+    return cloud_router._load_keys().get("ANTHROPIC_API_KEY", "")
+
+
+async def _claude(api_key: str, prompt: str) -> str:
+    """One reply from Claude through the official SDK. Raises SDK errors."""
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
+    request = {
+        "model": CLOUD_MODEL,
+        "max_tokens": 16000,
+        # These replies are short and spoken aloud, so favour a quick answer.
+        "output_config": {"effort": "low"},
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    if CLOUD_MODEL.startswith(_FALLBACK_MODELS):
+        # If the model declines a request, let the API retry it on a fallback
+        # model inside the same call instead of returning nothing.
+        response = await client.beta.messages.create(
+            betas=["server-side-fallback-2026-07-01"], fallbacks="default", **request
+        )
+    else:
+        response = await client.messages.create(**request)
+    if response.stop_reason == "refusal":
+        return ""
+    return "".join(b.text for b in response.content if b.type == "text").strip()
 
 
 async def _complete(
@@ -168,17 +207,11 @@ async def _complete(
 ) -> str:
     """One model reply: the online model when a key is saved, else local."""
     from openjarvis.core.types import Message, Role
-    from openjarvis.server import cloud_router
 
-    messages = [Message(role=Role.USER, content=prompt)]
-    if cloud_router._load_keys().get("ANTHROPIC_API_KEY"):
+    api_key = _api_key()
+    if api_key:
         try:
-            parts = []
-            async for token in cloud_router.stream_cloud(
-                CLOUD_MODEL, messages, temperature=temperature, max_tokens=max_tokens
-            ):
-                parts.append(token)
-            text = "".join(parts).strip()
+            text = await _claude(api_key, prompt)
             if text:
                 return text
         except Exception:
@@ -189,7 +222,7 @@ async def _complete(
         raise NoModelError("No model is configured")
     result = await asyncio.to_thread(
         engine.generate,
-        messages,
+        [Message(role=Role.USER, content=prompt)],
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
@@ -198,9 +231,7 @@ async def _complete(
 
 
 def _online(request: Request) -> bool:
-    from openjarvis.server import cloud_router
-
-    return bool(cloud_router._load_keys().get("ANTHROPIC_API_KEY"))
+    return bool(_api_key())
 
 
 async def _breakdown(request: Request, title: str) -> List[str]:
@@ -279,6 +310,86 @@ async def delete_capture(request: Request, capture_id: str):
 @focus_router.put("/risk")
 async def set_risk(request: Request, body: RiskBody):
     return {"risk_per_trade": _store(request).set_risk(body.risk_per_trade)}
+
+
+def _local_only(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    if host not in _LOOPBACK:
+        raise HTTPException(status_code=403, detail="Only from this computer")
+
+
+def _write_key(value: str) -> None:
+    """Store or remove the Anthropic key in the per-user keys file."""
+    from openjarvis.server import cloud_router
+
+    path = cloud_router._CLOUD_ENV_FILE
+    lines = []
+    if path.exists():
+        lines = [
+            ln
+            for ln in path.read_text().splitlines()
+            if not ln.strip().startswith("ANTHROPIC_API_KEY=")
+        ]
+    if value:
+        lines.append(f"ANTHROPIC_API_KEY={value}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + ("\n" if lines else ""))
+    path.chmod(0o600)
+
+
+@focus_router.get("/key")
+async def key_status(request: Request):
+    """Whether an online key is saved. The key itself is never returned."""
+    return {"configured": bool(_api_key()), "model": CLOUD_MODEL}
+
+
+@focus_router.put("/key")
+async def save_key(request: Request, body: KeyBody):
+    _local_only(request)
+    key = body.key.strip()
+    if key and (not key.startswith("sk-ant-") or len(key) < 20 or " " in key):
+        raise HTTPException(
+            status_code=400, detail="That does not look like an Anthropic API key"
+        )
+    _write_key(key)
+    return {"configured": bool(_api_key()), "model": CLOUD_MODEL}
+
+
+@focus_router.post("/key/test")
+async def test_key(request: Request):
+    """Make one tiny request with the saved key and report what happened."""
+    _local_only(request)
+    api_key = _api_key()
+    if not api_key:
+        return {"ok": False, "error": "No key is saved yet."}
+    import anthropic
+
+    try:
+        text = await _claude(api_key, "Reply with the single word: ready")
+    except anthropic.AuthenticationError:
+        return {
+            "ok": False,
+            "error": "The key was rejected. Check you copied all of it.",
+        }
+    except anthropic.PermissionDeniedError:
+        return {"ok": False, "error": "This key is not allowed to use that model."}
+    except anthropic.NotFoundError:
+        return {"ok": False, "error": f"The model {CLOUD_MODEL} was not found."}
+    except anthropic.RateLimitError:
+        return {"ok": False, "error": "Rate limited. Wait a minute and test again."}
+    except anthropic.APIStatusError as exc:
+        detail = getattr(exc, "message", "") or f"error {exc.status_code}"
+        return {"ok": False, "error": f"The service answered: {detail}"}
+    except anthropic.APIConnectionError:
+        return {
+            "ok": False,
+            "error": "Could not reach the service. Check the internet.",
+        }
+    return {
+        "ok": bool(text),
+        "model": CLOUD_MODEL,
+        "error": "" if text else "Empty reply.",
+    }
 
 
 @focus_router.put("/goal")
@@ -803,9 +914,6 @@ async def voice_command(request: Request, body: CommandBody):
             out["say"] = ""
         out["say"] = out["say"] or "I do not have an answer for that."
     return out
-
-
-_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
 
 
 def _alert_allowed(request: Request, token: Optional[str]) -> bool:

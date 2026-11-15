@@ -7,7 +7,10 @@ from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from openjarvis.focus.store import FocusStore  # noqa: E402
+from openjarvis.server import cloud_router as _cloud_router  # noqa: E402
 from openjarvis.server.focus_routes import focus_router, parse_steps  # noqa: E402
+
+_REAL_LOAD_KEYS = _cloud_router._load_keys
 
 
 class _Engine:
@@ -244,20 +247,20 @@ def test_parse_tutor_falls_back_to_plain_text():
 
 
 def test_online_model_is_used_when_a_key_is_saved(client, monkeypatch):
-    from openjarvis.server import cloud_router
+    from openjarvis.server import cloud_router, focus_routes
 
     seen = {}
 
-    async def fake_stream(model, messages, temperature=0.7, max_tokens=1024):
-        seen["model"] = model
-        for part in ('["Open', ' mail"]'):
-            yield part
+    async def fake_claude(api_key, prompt):
+        seen["key"] = api_key
+        return '["Open mail"]'
 
     monkeypatch.setattr(cloud_router, "_load_keys", lambda: {"ANTHROPIC_API_KEY": "k"})
-    monkeypatch.setattr(cloud_router, "stream_cloud", fake_stream)
+    monkeypatch.setattr(focus_routes, "_claude", fake_claude)
     task = client.post("/v1/focus/task", json={"title": "Send invoice"}).json()
     assert task["steps"] == ["Open mail"]
-    assert seen["model"].startswith("claude-")
+    assert seen["key"] == "k"
+    assert focus_routes.CLOUD_MODEL.startswith("claude-")
 
 
 def test_warm_listening_reports_ready(client):
@@ -513,3 +516,91 @@ def test_speak_uses_the_chosen_calm_voice_and_caches(client):
         ("Now.", "am_eric"),
         ("hola", "em_alex"),
     ]
+
+
+def test_online_request_shape(monkeypatch):
+    """The request sent to Claude: fallbacks on, low effort, no sampling params."""
+    import asyncio
+    import types
+
+    anthropic = pytest.importorskip("anthropic")
+
+    from openjarvis.server import focus_routes
+
+    calls = {}
+
+    class FakeMessages:
+        async def create(self, **kwargs):
+            calls.update(kwargs)
+            block = types.SimpleNamespace(type="text", text=" ready ")
+            thinking = types.SimpleNamespace(type="thinking", thinking="")
+            return types.SimpleNamespace(
+                stop_reason="end_turn", content=[thinking, block]
+            )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            calls["client"] = kwargs
+            self.beta = types.SimpleNamespace(messages=FakeMessages())
+            self.messages = FakeMessages()
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeClient)
+    monkeypatch.setattr(focus_routes, "CLOUD_MODEL", "claude-opus-5-5")
+    assert asyncio.run(focus_routes._claude("sk-ant-x", "hi")) == "ready"
+    assert calls["client"]["api_key"] == "sk-ant-x"
+    assert calls["model"] == "claude-opus-5-5"
+    assert calls["fallbacks"] == "default"
+    assert calls["betas"] == ["server-side-fallback-2026-07-01"]
+    assert calls["output_config"] == {"effort": "low"}
+    assert "temperature" not in calls and "thinking" not in calls
+
+
+def test_key_is_saved_locally_and_never_returned(client, monkeypatch, tmp_path):
+    pytest.importorskip("anthropic")
+    from openjarvis.server import cloud_router, focus_routes
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(cloud_router, "_load_keys", _REAL_LOAD_KEYS)
+    keys = tmp_path / "cloud-keys.env"
+    keys.write_text("OPENAI_API_KEY=keepme\n")
+    monkeypatch.setattr(cloud_router, "_CLOUD_ENV_FILE", keys)
+    assert client.get("/v1/focus/key").json()["configured"] is False
+    assert client.post("/v1/focus/key/test").json()["ok"] is False
+    bad = client.put("/v1/focus/key", json={"key": "hello"})
+    assert bad.status_code == 400
+    key = "sk-ant-" + "a" * 40
+    saved = client.put("/v1/focus/key", json={"key": f"  {key} "})
+    assert saved.json() == {"configured": True, "model": focus_routes.CLOUD_MODEL}
+    assert key not in saved.text
+    assert keys.read_text() == f"OPENAI_API_KEY=keepme\nANTHROPIC_API_KEY={key}\n"
+    assert oct(keys.stat().st_mode & 0o777) == "0o600"
+
+    async def fake_claude(api_key, prompt):
+        assert api_key == key
+        return "ready"
+
+    monkeypatch.setattr(focus_routes, "_claude", fake_claude)
+    assert client.post("/v1/focus/key/test").json()["ok"] is True
+    client.put("/v1/focus/key", json={"key": ""})
+    assert keys.read_text() == "OPENAI_API_KEY=keepme\n"
+    assert client.get("/v1/focus/key").json()["configured"] is False
+
+
+def test_key_test_reports_a_rejected_key(client, monkeypatch):
+    anthropic = pytest.importorskip("anthropic")
+    httpx2 = pytest.importorskip("httpx2")
+
+    from openjarvis.server import cloud_router, focus_routes
+
+    async def rejected(api_key, prompt):
+        request = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+        raise anthropic.AuthenticationError(
+            "invalid x-api-key",
+            response=httpx2.Response(401, request=request),
+            body=None,
+        )
+
+    monkeypatch.setattr(cloud_router, "_load_keys", lambda: {"ANTHROPIC_API_KEY": "k"})
+    monkeypatch.setattr(focus_routes, "_claude", rejected)
+    out = client.post("/v1/focus/key/test").json()
+    assert out["ok"] is False and "rejected" in out["error"]

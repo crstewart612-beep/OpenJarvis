@@ -58,6 +58,8 @@ def test_gui_custom_ports_use_project_root_and_same_origin_proxy(
             "desktop",
             "--extra",
             "voice",
+            "--extra",
+            "inference-cloud",
             "jarvis",
             "start",
             "--port",
