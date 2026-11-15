@@ -39,10 +39,12 @@ interface SpanishProgress {
   unit: string; unit_number: number; unit_count: number; unit_mastered?: number; unit_total?: number;
 }
 interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
+interface CalEvent { title: string; start: string; all_day: boolean; calendar: string }
+interface CalState { available: boolean; events: CalEvent[]; calendars: string[]; write_to: string; source: string; note: string; error: string }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 22';
+const BUILD = 'build 23';
 // What the assistant is called on screen and out loud.
 const NAME = 'Morpheus';
 const NAV: [string, string][] = [
@@ -377,6 +379,7 @@ export function FocusPage() {
   const [keyOpen, setKeyOpen] = useState(false);
   const [keyText, setKeyText] = useState('');
   const [keyNote, setKeyNote] = useState('');
+  const [cal, setCal] = useState<CalState | null>(null);
   const rainRef = useRef<HTMLCanvasElement>(null);
   const [taskTab, setTaskTab] = useState<'all' | 'today' | 'upcoming' | 'done'>('all');
   const [dumpText, setDumpText] = useState('');
@@ -413,6 +416,8 @@ export function FocusPage() {
       setOffline(false);
       const sp = await send('/v1/focus/spanish', 'GET');
       if (sp.ok) setLesson(await sp.json());
+      const cl = await send('/v1/focus/calendar', 'GET');
+      if (cl.ok) setCal(await cl.json());
     } catch {
       setOffline(true);
     }
@@ -1010,6 +1015,11 @@ export function FocusPage() {
     if (res?.ok) { setOnline(await res.json()); setKeyNote('Key removed.'); }
   };
 
+  const chooseCalendar = async (name: string) => {
+    await send('/v1/focus/calendar', 'PUT', { write_to: name }).catch(() => null);
+    await refresh();
+  };
+
   const chooseVoice = (next: string) => {
     voiceChoice = next;
     setVoice(next);
@@ -1350,6 +1360,10 @@ export function FocusPage() {
       : taskTab === 'upcoming' ? upcoming : doneTasks;
   const priorities = [...overdueTasks, ...openTasks.filter((t) => !t.overdue)].slice(0, 3);
   const schedule = openTasks.filter((t) => t.due).sort((a, b) => (a.due ?? '').localeCompare(b.due ?? '')).slice(0, 6);
+  const agenda = [
+    ...schedule.map((t) => ({ key: `t-${t.id}`, when: t.due ?? '', title: t.title, tag: 'Task', late: t.overdue, allDay: false })),
+    ...(cal?.events ?? []).map((e, k) => ({ key: `e-${k}-${e.start}`, when: e.start, title: e.title, tag: e.calendar, late: false, allDay: e.all_day })),
+  ].sort((a, b) => new Date(a.when).getTime() - new Date(b.when).getTime()).slice(0, 8);
   const entries = state?.goal.entries ?? [];
   const todayPnl = entries.filter((e) => e.at.slice(0, 10) === todayKey).reduce((sum, e) => sum + e.amount, 0);
   const goalPct = state ? Math.max(0, Math.min(100, (state.goal.saved / state.goal.target) * 100)) : 0;
@@ -1508,17 +1522,17 @@ export function FocusPage() {
 
         <section className="card">
           <h2><CalendarDays size={20} /> Calendar <span>Next up</span></h2>
-          {schedule.length ? (
+          {agenda.length ? (
             <ul className="agenda">
-              {schedule.map((t) => (
-                <li key={t.id} className={t.overdue ? 'overdue' : ''}>
-                  <time>{fmtDue(t.due ?? '')}</time>
-                  <span>{t.title}</span>
+              {agenda.map((a) => (
+                <li key={a.key} className={a.late ? 'overdue' : ''}>
+                  <time>{a.allDay ? new Date(a.when).toLocaleDateString([], { month: 'short', day: 'numeric' }) : fmtDue(a.when)}</time>
+                  <span>{a.title}<small>{a.tag}</small></span>
                 </li>
               ))}
             </ul>
-          ) : <p className="note">No dated tasks yet. Say “Hey {NAME}, add … for Friday at 3”.</p>}
-          <p className="note foot">Outlook and Google calendars are not connected yet.</p>
+          ) : <p className="note">Nothing coming up. Say “Hey {NAME}, add … for Friday at 3”.</p>}
+          <p className="note foot">{cal?.error ? cal.error : cal?.available ? (cal.write_to ? `New dated tasks also go to “${cal.write_to}”.` : 'Showing your Mac calendars.') : 'Mac calendars are not connected.'}</p>
         </section>
 
         <section className="card">
@@ -1713,7 +1727,35 @@ export function FocusPage() {
           {section === 'calendar' && (
             <div className="grid12">
               <div className="span8">{tasksPanel}</div>
-              <div className="span4">{soon('Calendar', 'Outlook and Google calendars are not connected yet. For now your dated tasks are your calendar.')}</div>
+              <div className="span4">
+                <div className="panel">
+                  <h2>Mac calendars</h2>
+                  {!cal?.available ? (
+                    <p className="note">Calendars can only be read on a Mac.</p>
+                  ) : (
+                    <>
+                      {cal.error && <p className="fb bad" style={{ textAlign: 'left' }}>{cal.error}</p>}
+                      <p className="note">{cal.events.length} upcoming event{cal.events.length === 1 ? '' : 's'} from the Calendar app{cal.source === 'database' ? ', including repeating ones' : ''}.</p>
+                      {cal.note && <p className="note">{cal.note}</p>}
+                      <label className="voicepick" style={{ padding: '10px 0 0' }}>
+                        <small>Also put my dated tasks on</small>
+                        <select id="focus-calendar" value={cal.write_to} onChange={(e) => void chooseCalendar(e.target.value)}>
+                          <option value="">No calendar (tasks only)</option>
+                          {cal.calendars.map((name) => <option key={name} value={name}>{name}</option>)}
+                        </select>
+                      </label>
+                      <ul style={{ marginTop: 10 }}>
+                        {cal.events.slice(0, 12).map((e, k) => (
+                          <li key={`${k}-${e.start}`}>
+                            <span>{e.title}</span>
+                            <span className="m">{e.all_day ? new Date(e.start).toLocaleDateString([], { month: 'short', day: 'numeric' }) : fmtDue(e.start)} · {e.calendar}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </>
+                  )}
+                </div>
+              </div>
             </div>
           )}
           {section === 'email' && <div className="grid12"><div className="span8">{soon('Email', 'Gmail, Yahoo and Outlook are not connected yet, so nothing is read, sorted or sent.')}</div></div>}

@@ -604,3 +604,55 @@ def test_key_test_reports_a_rejected_key(client, monkeypatch):
     monkeypatch.setattr(focus_routes, "_claude", rejected)
     out = client.post("/v1/focus/key/test").json()
     assert out["ok"] is False and "rejected" in out["error"]
+
+
+def test_calendar_route_and_copying_dated_tasks(client, monkeypatch):
+    import time
+
+    from openjarvis.focus import mac_calendar
+
+    created = []
+    monkeypatch.setattr(mac_calendar, "available", lambda: True)
+    monkeypatch.setattr(
+        mac_calendar,
+        "read_events",
+        lambda: {"events": [{"title": "Standup"}], "source": "database", "note": ""},
+    )
+    monkeypatch.setattr(mac_calendar, "calendars", lambda: ["Work", "Home"])
+    monkeypatch.setattr(mac_calendar, "create_event", lambda *a: created.append(a))
+    out = client.get("/v1/focus/calendar").json()
+    assert out["events"] == [{"title": "Standup"}] and out["calendars"] == [
+        "Work",
+        "Home",
+    ]
+    assert out["write_to"] == ""
+    client.post(
+        "/v1/focus/task", json={"title": "A", "steps": ["a"], "due": "2026-11-20T15:00"}
+    )
+    assert created == []
+    client.put("/v1/focus/calendar", json={"write_to": "Work"})
+    client.post(
+        "/v1/focus/task", json={"title": "B", "steps": ["b"], "due": "2026-11-20T15:00"}
+    )
+    client.post(
+        "/v1/focus/task", json={"title": "C", "steps": ["c"], "due": "2026-11-21T23:59"}
+    )
+    client.post("/v1/focus/task", json={"title": "D", "steps": ["d"]})
+    for _ in range(50):
+        if len(created) >= 2:
+            break
+        client.get("/v1/focus/state")
+        time.sleep(0.01)
+    assert [(c[0], c[1], c[2].isoformat(), c[4]) for c in created] == [
+        ("Work", "B", "2026-11-20T15:00:00", False),
+        ("Work", "C", "2026-11-21T00:00:00", True),
+    ]
+    assert client.get("/v1/focus/calendar").json()["write_to"] == "Work"
+
+
+def test_calendar_route_off_the_mac(client, monkeypatch):
+    from openjarvis.focus import mac_calendar
+
+    monkeypatch.setattr(mac_calendar, "available", lambda: False)
+    out = client.get("/v1/focus/calendar").json()
+    assert out["available"] is False and out["events"] == []

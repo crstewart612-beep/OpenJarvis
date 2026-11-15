@@ -9,12 +9,14 @@ import logging
 import os
 import re
 import tempfile
+import time
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from openjarvis.focus import commands, spanish
+from openjarvis.focus import commands, mac_calendar, spanish
 from openjarvis.focus.signals import (
     CONTRACTS,
     max_stop_points,
@@ -118,6 +120,11 @@ class CommandBody(BaseModel):
     awake: bool = False
     # Set when Jarvis asked a follow-up question and this is the answer.
     pending: str = Field(default="", max_length=300)
+
+
+class CalendarBody(BaseModel):
+    # Name of the calendar new dated tasks are copied to; empty turns it off.
+    write_to: str = Field(default="", max_length=200)
 
 
 class KeyBody(BaseModel):
@@ -265,7 +272,9 @@ async def add_task(request: Request, body: TaskBody):
     steps = [s.strip() for s in (body.steps or []) if s.strip()]
     if not steps:
         steps = await _breakdown(request, title)
-    return _store(request).add_task(title, steps, body.due)
+    task = _store(request).add_task(title, steps, body.due)
+    _copy_to_calendar(request, title, body.due)
+    return task
 
 
 @focus_router.post("/task/{task_id}/step")
@@ -335,6 +344,80 @@ def _write_key(value: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + ("\n" if lines else ""))
     path.chmod(0o600)
+
+
+def _background(request: Request, coro) -> None:
+    job = asyncio.create_task(coro)
+    jobs = getattr(request.app.state, "focus_jobs", None)
+    if jobs is None:
+        jobs = request.app.state.focus_jobs = set()
+    jobs.add(job)
+    job.add_done_callback(jobs.discard)
+
+
+def _copy_to_calendar(request: Request, title: str, due: Optional[str]) -> None:
+    """Put a dated task on the chosen Mac calendar, without holding up the reply."""
+    target = (_store(request).section("calendar") or {}).get("write_to", "")
+    if not (due and target and mac_calendar.available()):
+        return
+    try:
+        when = datetime.fromisoformat(due)
+    except ValueError:
+        return
+    # 23:59 is how "that day, no particular time" is stored.
+    all_day = (when.hour, when.minute) == (23, 59)
+    if all_day:
+        when = when.replace(hour=0, minute=0)
+
+    async def _add() -> None:
+        try:
+            await asyncio.to_thread(
+                mac_calendar.create_event, target, title, when, 30, all_day
+            )
+            request.app.state.focus_calendar_cache = None
+            request.app.state.focus_calendar_error = ""
+        except Exception as exc:
+            logger.warning("Could not add %r to the calendar: %s", title, exc)
+            request.app.state.focus_calendar_error = str(exc)
+
+    _background(request, _add())
+
+
+@focus_router.get("/calendar")
+async def calendar_events(request: Request):
+    """Upcoming events from the Mac's Calendar app, cached for two minutes."""
+    state = request.app.state
+    write_to = (_store(request).section("calendar") or {}).get("write_to", "")
+    out = {
+        "available": mac_calendar.available(),
+        "events": [],
+        "calendars": [],
+        "write_to": write_to,
+        "source": "none",
+        "note": "",
+        "error": getattr(state, "focus_calendar_error", ""),
+    }
+    if not out["available"]:
+        return out
+    cached = getattr(state, "focus_calendar_cache", None)
+    if cached and time.monotonic() - cached[0] < 120:
+        return {**out, **cached[1]}
+    try:
+        data = await asyncio.to_thread(mac_calendar.read_events)
+        data["calendars"] = await asyncio.to_thread(mac_calendar.calendars)
+    except mac_calendar.CalendarError as exc:
+        return {**out, "error": str(exc)}
+    except Exception:
+        logger.exception("Calendar read failed")
+        return {**out, "error": "The calendar could not be read."}
+    state.focus_calendar_cache = (time.monotonic(), data)
+    return {**out, **data}
+
+
+@focus_router.put("/calendar")
+async def set_calendar(request: Request, body: CalendarBody):
+    _store(request).save_section("calendar", {"write_to": body.write_to.strip()})
+    return {"write_to": body.write_to.strip()}
 
 
 @focus_router.get("/key")
@@ -843,6 +926,7 @@ async def _improve_steps(request: Request, task_id: str, title: str) -> None:
 
 def _add_spoken_task(request: Request, plan: dict) -> str:
     task = _store(request).add_task(plan["title"], [plan["title"]], plan["due"])
+    _copy_to_calendar(request, plan["title"], plan["due"])
     job = asyncio.create_task(_improve_steps(request, task["id"], plan["title"]))
     jobs = getattr(request.app.state, "focus_jobs", None)
     if jobs is None:
