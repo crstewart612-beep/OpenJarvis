@@ -37,7 +37,7 @@ interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 15';
+const BUILD = 'build 16';
 const SPRINT_SECONDS = 15 * 60;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CALM_LINE = "Take a breath. One thing at a time. I'm right here with you.";
@@ -100,6 +100,8 @@ function stopSpeaking(): void {
 // Lines Jarvis says often ("Correct.", "What does that mean?") are kept after
 // the first time so they play at once instead of being generated again.
 const spoken = new Map<string, AudioBuffer>();
+// Why the last line could not be spoken, for showing on screen.
+let speakProblem = '';
 
 /** Speak text in one of the voices. Resolves when playback has finished. */
 async function speak(text: string, mode: 'calm' | 'deadline' | 'es', signal?: AbortSignal): Promise<void> {
@@ -109,7 +111,8 @@ async function speak(text: string, mode: 'calm' | 'deadline' | 'es', signal?: Ab
     let buffer = spoken.get(key);
     if (!buffer) {
       const res = await send('/v1/focus/speak', 'POST', { text, mode }, signal);
-      if (!res.ok) return;
+      if (!res.ok) { speakProblem = `The voice engine answered with error ${res.status}`; return; }
+      speakProblem = '';
       buffer = await out.decodeAudioData(await res.arrayBuffer());
       if (spoken.size > 150) spoken.clear();
       spoken.set(key, buffer);
@@ -274,6 +277,8 @@ export function FocusPage() {
   });
   const autoStarted = useRef(false);
   const [wake, setWake] = useState(false);
+  const [soundOff, setSoundOff] = useState(true);
+  const [voiceProblem, setVoiceProblem] = useState('');
   const [wakeStatus, setWakeStatus] = useState('');
   const wakeRef = useRef(false);
   const busyRef = useRef(false);
@@ -315,11 +320,13 @@ export function FocusPage() {
   }, [refresh]);
 
   useEffect(() => {
-    window.addEventListener('pointerdown', unlockAudio);
-    window.addEventListener('keydown', unlockAudio);
+    // Safari only counts some events as "the person clicked", so listen to all.
+    const gestures = ['click', 'mousedown', 'pointerdown', 'touchend', 'keydown'];
+    gestures.forEach((name) => window.addEventListener(name, unlockAudio, true));
+    const watch = setInterval(() => { setSoundOff(audioLocked()); setVoiceProblem(speakProblem); }, 1000);
     return () => {
-      window.removeEventListener('pointerdown', unlockAudio);
-      window.removeEventListener('keydown', unlockAudio);
+      gestures.forEach((name) => window.removeEventListener(name, unlockAudio, true));
+      clearInterval(watch);
       talkRef.current = false;
       talkAbort.current?.abort();
       closeMic();
@@ -629,6 +636,7 @@ export function FocusPage() {
       setLesson(current);
       await tell('Picking up where you left off.');
       let silent = 0;
+      let handOff = '';
       while (talkRef.current) {
         const card = current.card;
         if (!card) { await tell('You have mastered every unit. Well done.'); break; }
@@ -642,7 +650,7 @@ export function FocusPage() {
         let attempts = 0;
         let next: SpanishLesson | null = null;
         while (talkRef.current && !next) {
-          setTalkStatus('Listening… your turn.');
+          setTalkStatus(card.kind === 'choose' ? 'Listening… say what it means, in English.' : 'Listening… say it in Spanish.');
           chime();
           const rec = await recordUtterance({ waitMs: 9000, silenceMs: 900, maxMs: 10000, cancelled });
           if (!talkRef.current) break;
@@ -665,10 +673,17 @@ export function FocusPage() {
             body: audioForm(rec, { item_id: card.item_id, kind: card.kind, final: attempts >= 2 ? '1' : '0' }),
           }).catch(() => null);
           if (!res?.ok) throw new Error(await errorDetail(res, 'I could not check that.'));
-          const data = await res.json() as { heard: string; correct: boolean; command: string | null; card: SpanishCard | null; progress: SpanishProgress };
+          const data = await res.json() as { heard: string; correct: boolean; command: string | null; wake_text: string; card: SpanishCard | null; progress: SpanishProgress };
           const after = { card: data.card, progress: data.progress };
           push({ role: 'you', text: data.heard || '(nothing clear)' });
           if (data.command === 'stop') { talkRef.current = false; break; }
+          if (data.command === 'wake') { talkRef.current = false; handOff = data.wake_text; break; }
+          if (data.command === 'said_spanish') {
+            attempts -= 1;
+            setFeedback({ ok: false, text: 'That is the Spanish. Say what it means, in English.' });
+            await tell('That is the Spanish. What does it mean, in English?');
+            continue;
+          }
           if (data.command === 'repeat') { attempts -= 1; await prompt(); continue; }
           if (data.command === 'skip') { setFeedback(null); await tell('Skipped.'); next = after; break; }
           if (data.correct) {
@@ -690,6 +705,17 @@ export function FocusPage() {
         if (next) { current = next; setLesson(next); }
       }
       setTalkStatus('');
+      // "Hey Jarvis, ..." said during the lesson: leave the lesson and do it.
+      if (handOff) {
+        const res = await send('/v1/focus/command', 'POST', { text: handOff }).catch(() => null);
+        if (res?.ok) {
+          const out = await res.json() as { say?: string; action?: string | null };
+          if (out.say) { setSay(out.say); await speak(out.say, 'calm'); }
+          await refresh();
+          if (out.action === 'sprint') actionsRef.current.startSprint();
+          if (out.action === 'step_done') actionsRef.current.stepDone();
+        }
+      }
     } catch (err) {
       setTalkStatus(abort.signal.aborted ? '' : err instanceof Error ? err.message : 'The lesson stopped.');
     } finally {
@@ -791,17 +817,17 @@ export function FocusPage() {
     const begin = () => {
       if (autoStarted.current) return;
       autoStarted.current = true;
-      window.removeEventListener('pointerdown', begin);
+      window.removeEventListener('click', begin);
       window.removeEventListener('keydown', begin);
       startWake();
     };
     unlockAudio();
     if (out?.state === 'running') { begin(); return; }
     setWakeStatus('Click anywhere once and I will start listening.');
-    window.addEventListener('pointerdown', begin);
+    window.addEventListener('click', begin);
     window.addEventListener('keydown', begin);
     return () => {
-      window.removeEventListener('pointerdown', begin);
+      window.removeEventListener('click', begin);
       window.removeEventListener('keydown', begin);
     };
   }, [autoListen, sttReady]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -843,6 +869,8 @@ export function FocusPage() {
           <span className="brand">FOCUS HUD</span>
           <span><span className={offline ? 'dot off' : 'dot'} />Jarvis server: <b>{offline ? 'not reachable' : 'connected'}</b></span>
           <span>Tasks, notes and voice stay on this Mac · {BUILD}</span>
+          {soundOff && <span className="late">Sound is off: click anywhere on this page to turn it on</span>}
+          {voiceProblem && <span className="late">{voiceProblem}</span>}
           <Link className="btn" to="/">Chat</Link>
         </div>
 

@@ -516,11 +516,25 @@ async def spanish_voice(request: Request):
     item = spanish._ITEMS[item_id]
     correct = spanish.check_voice(item_id, kind, heard)
     command = None
+    wake_text = ""
     if not correct:
+        english = heard if language == "en" else ""
         command = spanish.spoken_command(heard)
-        if command is None and language == "es":
-            # "Skip" or "stop" said in English is garbled by Spanish recognition.
-            command = spanish.spoken_command(await _run_stt(request, audio, ext, "en"))
+        if command is None and commands.extract_command(english) is None:
+            # Listen to the same recording in the other language: English said
+            # during a Spanish answer ("skip", "hey Jarvis...") is garbled by
+            # Spanish recognition, and the reverse.
+            other = await _run_stt(
+                request, audio, ext, "en" if language == "es" else "es"
+            )
+            if language == "es":
+                english = other
+                command = spanish.spoken_command(other)
+            elif spanish.close_enough(item["es"], other):
+                # Asked for the meaning, the learner read the Spanish aloud.
+                command = "said_spanish"
+        if commands.extract_command(english) is not None:
+            command, wake_text = "wake", english
     state = _spanish_state(request)
     if command == "skip":
         spanish.answer(state, item_id, "skip")
@@ -539,6 +553,7 @@ async def spanish_voice(request: Request):
         "heard": heard,
         "correct": correct and command is None,
         "command": command,
+        "wake_text": wake_text,
         "es": item["es"],
         "en": item["en"],
         "card": spanish.next_card(state),

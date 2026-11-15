@@ -398,3 +398,23 @@ def test_voice_lesson_gives_a_second_try(client):
     assert answer("stop", item_id="greetings:2", kind="type")["command"] == "stop"
     bad = answer("x", item_id="greetings:2", kind="nope")
     assert bad == {"detail": "Unknown card kind"}
+
+
+def test_voice_lesson_handles_spanish_read_aloud_and_the_wake_word(client):
+    files = {"file": ("a.mp4", b"abc", "audio/mp4")}
+
+    def answer(heard, **data):
+        client.app.state.focus_stt = _Stt(heard)
+        return client.post("/v1/focus/spanish/voice", files=files, data=data).json()
+
+    # Asked what "bien, gracias" means, the learner says the Spanish itself.
+    out = answer("Bien, gracias.", item_id="greetings:5", kind="choose", final="1")
+    assert out["command"] == "said_spanish" and out["correct"] is False
+    assert client.app.state.focus_store.section("spanish")["items"] == {}
+    right = answer("Fine, thank you.", item_id="greetings:5", kind="choose")
+    assert right["correct"] is True
+    wake = answer(
+        "Hey Jarvis, add milk to my list.", item_id="greetings:0", kind="type"
+    )
+    assert wake["command"] == "wake"
+    assert wake["wake_text"] == "Hey Jarvis, add milk to my list."
