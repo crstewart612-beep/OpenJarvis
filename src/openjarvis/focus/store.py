@@ -103,9 +103,16 @@ class FocusStore:
     def remove_task(self, task_id: str) -> bool:
         return self._remove("tasks", task_id)
 
-    def add_capture(self, text: str, now: Optional[datetime] = None) -> Dict[str, Any]:
+    def add_capture(
+        self, text: str, now: Optional[datetime] = None, kind: str = "note"
+    ) -> Dict[str, Any]:
         now = now or datetime.now()
-        item = {"id": _new_id(), "text": text, "at": now.isoformat(timespec="minutes")}
+        item = {
+            "id": _new_id(),
+            "text": text,
+            "kind": kind,
+            "at": now.isoformat(timespec="minutes"),
+        }
         with self._lock:
             data = self._load()
             data["captures"].insert(0, item)

@@ -290,3 +290,49 @@ def test_goal_tracks_trade_results(client):
     assert client.get("/v1/focus/state").json()["goal"]["saved"] == -20
     assert client.post("/v1/focus/goal/entry", json={"amount": 0}).status_code == 400
     assert client.put("/v1/focus/goal", json={"target": -5}).status_code == 422
+
+
+def test_voice_command_needs_the_wake_word(client):
+    out = client.post("/v1/focus/command", json={"text": "add milk to my list"}).json()
+    assert out == {"wake": False, "heard": "add milk to my list"}
+    assert client.get("/v1/focus/state").json()["tasks"] == []
+    only = client.post("/v1/focus/command", json={"text": "Hey Jarvis."}).json()
+    assert only["say"] == "Yes?"
+    follow = client.post(
+        "/v1/focus/command", json={"text": "add milk to my list", "awake": True}
+    ).json()
+    assert follow["intent"] == "task" and follow["say"] == "Added Milk."
+
+
+def test_voice_commands_change_the_right_lists(client):
+    def say(text):
+        return client.post("/v1/focus/command", json={"text": text}).json()
+
+    out = say(
+        "Hey Jarvis, add dentist appointment to my calendar for tomorrow at 3 PM."
+    )
+    assert out["say"] == "Added Dentist appointment for tomorrow at 3 PM."
+    say("Hey Jarvis, add a candle pop-up to my idea list")
+    say("Hey Jarvis, add find hair products to my brain dump")
+    goal = say("Hey Jarvis, I made 60 dollars on MES")
+    assert goal["say"] == "Added 60 dollars. Your goal is at 60 dollars."
+    assert say("Hey Jarvis, start a sprint")["action"] == "sprint"
+    assert "not connected" in say("Hey Jarvis, group my emails")["say"]
+    state = client.get("/v1/focus/state").json()
+    assert state["tasks"][0]["title"] == "Dentist appointment"
+    assert state["tasks"][0]["due"].endswith("T15:00")
+    kinds = {c["text"]: c["kind"] for c in state["captures"]}
+    assert kinds == {"Candle pop-up": "idea", "Find hair products": "note"}
+    assert state["goal"]["entries"][0]["note"] == "On mes"
+
+
+def test_unknown_command_is_answered_by_the_model(client):
+    class Answer:
+        def generate(self, messages, *, model, **kwargs):
+            return {"content": "Ninety-six."}
+
+    client.app.state.engine = Answer()
+    out = client.post(
+        "/v1/focus/command", json={"text": "Jarvis, what is twelve times eight?"}
+    ).json()
+    assert out["intent"] == "unknown" and out["say"] == "Ninety-six."

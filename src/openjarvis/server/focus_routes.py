@@ -13,7 +13,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from openjarvis.focus import spanish
+from openjarvis.focus import commands, spanish
 from openjarvis.focus.signals import (
     CONTRACTS,
     max_stop_points,
@@ -50,6 +50,7 @@ class TaskBody(BaseModel):
 
 class CaptureBody(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
+    kind: str = Field(default="note", pattern=r"^(note|idea)$")
 
 
 class RiskBody(BaseModel):
@@ -106,6 +107,12 @@ class GoalBody(BaseModel):
 class GoalEntryBody(BaseModel):
     amount: float = Field(ge=-1_000_000, le=1_000_000)
     note: str = Field(default="", max_length=120)
+
+
+class CommandBody(BaseModel):
+    text: str = Field(max_length=600)
+    # True when the wake word was heard just before, so this is the command.
+    awake: bool = False
 
 
 class SpeakBody(BaseModel):
@@ -226,7 +233,7 @@ async def delete_task(request: Request, task_id: str):
 
 @focus_router.post("/capture")
 async def add_capture(request: Request, body: CaptureBody):
-    return _store(request).add_capture(body.text.strip())
+    return _store(request).add_capture(body.text.strip(), kind=body.kind)
 
 
 @focus_router.delete("/capture/{capture_id}")
@@ -532,6 +539,68 @@ async def spanish_converse(request: Request, body: ConverseBody):
     spanish.touch(state)
     _store(request).save_section("spanish", state)
     return {**parse_tutor(reply), "progress": spanish.progress(state)}
+
+
+_ANSWER_PROMPT = (
+    "You are Jarvis, a calm voice assistant. Answer the question below in at "
+    "most two short sentences of plain spoken English, with no lists or "
+    "symbols.\n\nQuestion: {text}"
+)
+
+
+@focus_router.post("/command")
+async def voice_command(request: Request, body: CommandBody):
+    """Carry out one spoken command. Ignored unless the wake word was said."""
+    heard = body.text.strip()
+    command = commands.extract_command(heard)
+    if command is None:
+        if not body.awake:
+            return {"wake": False, "heard": heard}
+        command = heard
+    if not command:
+        return {"wake": True, "heard": heard, "intent": "none", "say": "Yes?"}
+    store = _store(request)
+    plan = commands.interpret(command)
+    intent = plan["intent"]
+    out = {"wake": True, "heard": heard, "intent": intent, "action": None}
+    if intent == "task":
+        steps = await _breakdown(request, plan["title"])
+        store.add_task(plan["title"], steps, plan["due"])
+        when = f" for {plan['when']}" if plan["when"] else ""
+        out["say"] = f"Added {plan['title']}{when}."
+    elif intent == "capture":
+        store.add_capture(plan["text"], kind=plan["kind"])
+        place = "idea list" if plan["kind"] == "idea" else "brain dump"
+        out["say"] = f"Added to your {place}: {plan['text']}."
+    elif intent == "goal":
+        store.add_goal_entry(plan["amount"], plan["note"])
+        saved = store.snapshot()["goal"]["saved"]
+        verb = "Added" if plan["amount"] > 0 else "Took off"
+        amount = abs(plan["amount"])
+        out["say"] = f"{verb} {amount:g} dollars. Your goal is at {saved:g} dollars."
+    elif intent == "action":
+        out["action"] = plan["action"]
+        out["say"] = {
+            "sprint": "Sprint started. Just this one step.",
+            "step_done": "",
+            "spanish": "",
+            "stop": "Okay. I will stop listening.",
+        }[plan["action"]]
+    elif intent == "email":
+        out["say"] = "Your email is not connected yet, so I cannot do that."
+    else:
+        try:
+            out["say"] = await _complete(
+                request,
+                _ANSWER_PROMPT.format(text=command),
+                temperature=0.3,
+                max_tokens=120,
+            )
+        except Exception:
+            logger.exception("Spoken question could not be answered")
+            out["say"] = ""
+        out["say"] = out["say"] or "I heard you, but I do not know how to do that yet."
+    return out
 
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}

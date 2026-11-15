@@ -12,7 +12,7 @@ interface FocusTask {
   done: boolean;
   overdue: boolean;
 }
-interface FocusCapture { id: string; text: string; at: string }
+interface FocusCapture { id: string; text: string; at: string; kind?: 'note' | 'idea' }
 interface FocusSignal { id: string; symbol: string; action: 'long' | 'short' | 'exit' | 'wait'; say: string; at: string }
 interface FocusJob { id: string; title: string; company: string; url: string; salary: string; status: 'found' | 'drafted' | 'submitted' | 'skipped'; draft: string }
 interface GoalEntry { id: string; amount: number; note: string; at: string }
@@ -37,6 +37,7 @@ interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 const SPRINT_SECONDS = 15 * 60;
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CALM_LINE = "Take a breath. One thing at a time. I'm right here with you.";
 
 const money = (n: number) =>
@@ -180,7 +181,7 @@ async function recordUtterance(opts: {
     };
     tick();
   });
-  rec.stop();
+  if (rec.state !== 'inactive') rec.stop();
   await stopped;
   if (!spoke || opts.cancelled?.()) return null;
   const type = rec.mimeType || mime || 'audio/webm';
@@ -230,6 +231,11 @@ export function FocusPage() {
     try { return localStorage.getItem('focus-auto-listen') === '1'; } catch { return false; }
   });
   const autoStarted = useRef(false);
+  const [wake, setWake] = useState(false);
+  const [wakeStatus, setWakeStatus] = useState('');
+  const wakeRef = useRef(false);
+  const busyRef = useRef(false);
+  const actionsRef = useRef({ startSprint: () => {}, stepDone: () => {}, startTalk: () => {} });
   const [sttReady, setSttReady] = useState(false);
   const sttReadyRef = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -489,6 +495,7 @@ export function FocusPage() {
     const card = lesson?.card;
     if (!card || micBusy || talking) return;
     unlockAudio();
+    busyRef.current = true;
     setMicBusy(true);
     setFeedback({ ok: true, text: 'Listening… say it now.' });
     try {
@@ -509,6 +516,7 @@ export function FocusPage() {
       setFeedback({ ok: false, text: err instanceof Error ? err.message : 'The microphone is not available.' });
     } finally {
       closeMic();
+      busyRef.current = false;
       setMicBusy(false);
     }
   };
@@ -581,9 +589,63 @@ export function FocusPage() {
     try { localStorage.setItem('focus-auto-listen', on ? '1' : '0'); } catch { /* not remembered */ }
   };
 
-  // With auto-listen on, start the conversation as soon as speech recognition
-  // is ready. Browsers stay silent until the page has been clicked once, so if
-  // sound is still locked the conversation starts on the first click instead.
+  // "Hey Jarvis": listen all the time, act only on speech that names Jarvis.
+  const runWake = async () => {
+    let awakeUntil = 0;
+    try {
+      await openMic();
+      while (wakeRef.current) {
+        if (talkRef.current || busyRef.current) { await sleep(400); continue; }
+        const awake = Date.now() < awakeUntil;
+        setWakeStatus(awake ? 'Yes? Go ahead.' : 'Say "Hey Jarvis", then what you need.');
+        const rec = await recordUtterance({
+          waitMs: 30000, silenceMs: 900, maxMs: 12000,
+          cancelled: () => !wakeRef.current || talkRef.current || busyRef.current,
+        });
+        if (!rec) continue;
+        const heard = await apiFetch('/v1/focus/listen', { method: 'POST', body: audioForm(rec, { language: 'en' }) }).catch(() => null);
+        if (!heard?.ok) throw new Error(await errorDetail(heard, 'I could not hear that.'));
+        const text = ((await heard.json()).text as string).trim();
+        if (!text || !wakeRef.current) continue;
+        const res = await send('/v1/focus/command', 'POST', { text, awake: Date.now() < awakeUntil }).catch(() => null);
+        if (!res?.ok) continue;
+        const out = await res.json() as { wake: boolean; heard: string; intent?: string; say?: string; action?: string | null };
+        if (!out.wake) continue;
+        awakeUntil = out.intent === 'none' ? Date.now() + 12000 : 0;
+        setWakeStatus(`Heard: ${out.heard}`);
+        if (out.say) { setSay(out.say); await speak(out.say, 'calm'); }
+        await refresh();
+        if (out.action === 'sprint') actionsRef.current.startSprint();
+        if (out.action === 'step_done') actionsRef.current.stepDone();
+        if (out.action === 'spanish') actionsRef.current.startTalk();
+        if (out.action === 'stop') break;
+      }
+      setWakeStatus('');
+    } catch (err) {
+      setWakeStatus(err instanceof Error ? err.message : 'Listening stopped.');
+    } finally {
+      wakeRef.current = false;
+      setWake(false);
+      if (!talkRef.current && !busyRef.current) closeMic();
+    }
+  };
+
+  const startWake = () => {
+    if (wakeRef.current) return;
+    unlockAudio();
+    wakeRef.current = true;
+    setWake(true);
+    void runWake();
+  };
+
+  const toggleWake = () => {
+    if (wake) { wakeRef.current = false; setWakeStatus(''); return; }
+    startWake();
+  };
+
+  // With the box ticked, start listening for "Hey Jarvis" as soon as speech
+  // recognition is ready. Browsers stay silent until the page has been clicked
+  // once, so if sound is still locked it starts on the first click instead.
   useEffect(() => {
     if (!autoListen || !sttReady || autoStarted.current) return;
     const begin = () => {
@@ -591,11 +653,11 @@ export function FocusPage() {
       autoStarted.current = true;
       window.removeEventListener('pointerdown', begin);
       window.removeEventListener('keydown', begin);
-      startTalk();
+      startWake();
     };
     unlockAudio();
     if (out?.state === 'running') { begin(); return; }
-    setTalkStatus('Click anywhere once and I will start listening.');
+    setWakeStatus('Click anywhere once and I will start listening.');
     window.addEventListener('pointerdown', begin);
     window.addEventListener('keydown', begin);
     return () => {
@@ -624,6 +686,12 @@ export function FocusPage() {
     if (!running && left === 0) setLeft(SPRINT_SECONDS);
     if (!running) setSay('Sprint started. Just this one step.');
     setRunning(!running);
+  };
+
+  actionsRef.current = {
+    startSprint: () => { if (!running) toggleSprint(); },
+    stepDone: () => { void stepDone(); },
+    startTalk,
   };
 
   const status = running ? 'Focus sprint' : mode === 'deadline' ? 'Overdue' : left < SPRINT_SECONDS && left > 0 ? 'Paused' : 'Ready';
@@ -675,7 +743,7 @@ export function FocusPage() {
               <ul style={{ marginTop: 10 }}>
                 {state?.captures.map((c) => (
                   <li key={c.id}>
-                    <span>{c.text}</span>
+                    <span>{c.kind === 'idea' && <span className="pill warn">idea</span>} {c.text}</span>
                     <span className="end">
                       <span className="m">{c.at.slice(11, 16)}</span>
                       <button className="small" onClick={() => void remove(`/v1/focus/capture/${c.id}`)}>Done</button>
@@ -749,6 +817,12 @@ export function FocusPage() {
                 <button className="primary" onClick={toggleSprint}>{running ? 'Pause' : left < SPRINT_SECONDS && left > 0 ? 'Resume sprint' : 'Start 15-min sprint'}</button>
                 <button onClick={() => void stepDone()} disabled={!current}>Step done</button>
               </div>
+              <div className="wake">
+                <button className={wake ? 'primary' : ''} onClick={toggleWake} disabled={!sttReady && !wake}>{wake ? 'Hey Jarvis: on' : 'Hey Jarvis: off'}</button>
+                {wakeStatus && <p className="note" aria-live="polite">{wakeStatus}</p>}
+                {!sttReady && <p className="note">Speech recognition is loading.</p>}
+                <label className="check"><input id="focus-auto-listen" type="checkbox" checked={autoListen} onChange={(e) => changeAutoListen(e.target.checked)} /> Turn on when this page opens</label>
+              </div>
             </div>
           </div>
 
@@ -800,7 +874,6 @@ export function FocusPage() {
                   <div className="talk">
                     <button className={talking ? 'primary' : ''} onClick={toggleTalk} disabled={micBusy || (!sttReady && !talking)}>{talking ? 'Stop talking' : 'Talk with Jarvis'}</button>
                     {!sttReady && <p className="note">Speech recognition is loading. The first time can take several minutes.</p>}
-                    <label className="check"><input id="focus-auto-listen" type="checkbox" checked={autoListen} onChange={(e) => changeAutoListen(e.target.checked)} /> Start listening when this page opens</label>
                     {talkStatus && <p className="note" aria-live="polite">{talkStatus}</p>}
                     {turns.length > 0 && (
                       <ul className="turns">
