@@ -227,6 +227,18 @@ async def step_done(request: Request, task_id: str):
     return task
 
 
+class DoneBody(BaseModel):
+    done: bool = True
+
+
+@focus_router.post("/task/{task_id}/done")
+async def set_task_done(request: Request, task_id: str, body: DoneBody):
+    task = _store(request).set_done(task_id, body.done)
+    if task is None:
+        raise HTTPException(status_code=404, detail="Task not found")
+    return task
+
+
 @focus_router.delete("/task/{task_id}")
 async def delete_task(request: Request, task_id: str):
     if not _store(request).remove_task(task_id):

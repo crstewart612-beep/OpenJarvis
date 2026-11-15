@@ -456,3 +456,15 @@ def test_steered_transcription_uses_the_model_and_falls_back():
     assert model.calls[0]["initial_prompt"] == "hola, adiós"
     assert model.calls[0]["language"] == "es" and model.calls[0]["vad_filter"] is True
     assert _steered_transcribe(Backend(None), b"abc", "mp4", "es", "") == "plain path"
+
+
+def test_task_can_be_ticked_off_and_reopened(client):
+    task = client.post(
+        "/v1/focus/task", json={"title": "T", "steps": ["a", "b"]}
+    ).json()
+    done = client.post(f"/v1/focus/task/{task['id']}/done", json={"done": True}).json()
+    assert done["done"] is True and done["step"] == 2
+    assert client.get("/v1/focus/state").json()["current"] is None
+    back = client.post(f"/v1/focus/task/{task['id']}/done", json={"done": False}).json()
+    assert back["done"] is False and back["step"] == 0
+    assert client.post("/v1/focus/task/nope/done", json={}).status_code == 404

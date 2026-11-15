@@ -1,5 +1,10 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
+import {
+  ArrowRight, Bell, Brain, BriefcaseBusiness, CalendarDays, Car, ChartCandlestick, ChartNoAxesColumn, Check, CircleAlert,
+  CircleCheck, Flame, GraduationCap, House, Layers, Lightbulb, Mail, MessageCircleMore, MessagesSquare, Mic, MicOff,
+  Pause, Play, Plus, Settings, Sparkles, SquareCheck, Target, TriangleAlert, X,
+} from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import './focus.css';
 
@@ -37,20 +42,21 @@ interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 18';
+const BUILD = 'build 19';
 // What the assistant is called on screen and out loud.
 const NAME = 'Morpheus';
 const NAV: [string, string][] = [
-  ['overview', '⌂ Overview'],
-  ['tasks', '✓ Tasks'],
-  ['ideas', '✦ Brain dump'],
-  ['spanish', '◉ Spanish'],
-  ['trading', '▥ Trading'],
-  ['car', '◈ Car fund'],
-  ['jobs', '▣ Job hunt'],
-  ['calendar', '▤ Calendar'],
-  ['email', '✉ Email'],
-  ['business', '◇ Business builder'],
+  ['overview', 'Overview'],
+  ['focus', 'Focus'],
+  ['tasks', 'Tasks'],
+  ['ideas', 'Brain Dump'],
+  ['calendar', 'Calendar'],
+  ['trading', 'Trading'],
+  ['car', 'Car Goal'],
+  ['spanish', 'Spanish'],
+  ['jobs', 'Job Hunt'],
+  ['email', 'Email'],
+  ['business', 'Business Builder'],
 ];
 const SPRINT_SECONDS = 15 * 60;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -292,6 +298,9 @@ export function FocusPage() {
   const autoStarted = useRef(false);
   const [wake, setWake] = useState(false);
   const [section, setSection] = useState('overview');
+  const [taskTab, setTaskTab] = useState<'all' | 'today' | 'upcoming' | 'done'>('all');
+  const [dumpText, setDumpText] = useState('');
+  const [dumpKind, setDumpKind] = useState<'task' | 'idea' | 'reminder' | 'later'>('task');
   const [ask, setAsk] = useState('');
   const askPending = useRef('');
   const [soundOff, setSoundOff] = useState(true);
@@ -456,6 +465,15 @@ export function FocusPage() {
       g.addColorStop(0, `${accent}cc`); g.addColorStop(0.6, `${accent}33`); g.addColorStop(1, `${accent}00`);
       cx.shadowBlur = 0; cx.fillStyle = g;
       cx.beginPath(); cx.arc(0, 0, cr * 1.5, 0, Math.PI * 2); cx.fill();
+      if (root.dataset.section === 'overview') {
+        // Voice bars in the middle: taller and quicker while listening.
+        const loud = root.dataset.voice === 'on';
+        cx.fillStyle = '#eaffff';
+        for (let k = -2; k <= 2; k++) {
+          const h = R * (0.07 + (loud ? 0.16 : 0.05) * Math.abs(Math.sin(t * (loud ? 6 : 1.5) + k * 0.9)));
+          cx.fillRect(k * R * 0.07 - R * 0.016, -h, R * 0.032, h * 2);
+        }
+      }
       cx.restore();
       if (!still) frame = requestAnimationFrame(draw);
     };
@@ -1148,108 +1166,344 @@ export function FocusPage() {
       <p className="note" style={{ margin: 0 }}>{text}</p>
     </div>
   );
-  const overdueCount = state?.tasks.filter((t) => t.overdue).length ?? 0;
-  const openCount = state?.tasks.filter((t) => !t.done).length ?? 0;
+  // ---- figures the dashboard shows, all from saved data ----
+  const todayKey = localDate(now);
+  const tasks = state?.tasks ?? [];
+  const openTasks = tasks.filter((t) => !t.done);
+  const overdueTasks = openTasks.filter((t) => t.overdue);
+  const dueToday = openTasks.filter((t) => !t.overdue && t.due?.slice(0, 10) === todayKey);
+  const upcoming = openTasks.filter((t) => t.due && t.due.slice(0, 10) > todayKey);
+  const doneTasks = tasks.filter((t) => t.done);
+  const overdueCount = overdueTasks.length;
+  const openCount = openTasks.length;
+  const shownTasks = taskTab === 'all' ? openTasks
+    : taskTab === 'today' ? [...overdueTasks, ...dueToday]
+      : taskTab === 'upcoming' ? upcoming : doneTasks;
+  const priorities = [...overdueTasks, ...openTasks.filter((t) => !t.overdue)].slice(0, 3);
+  const schedule = openTasks.filter((t) => t.due).sort((a, b) => (a.due ?? '').localeCompare(b.due ?? '')).slice(0, 6);
+  const entries = state?.goal.entries ?? [];
+  const todayPnl = entries.filter((e) => e.at.slice(0, 10) === todayKey).reduce((sum, e) => sum + e.amount, 0);
+  const goalPct = state ? Math.max(0, Math.min(100, (state.goal.saved / state.goal.target) * 100)) : 0;
+  const ideas = (state?.captures ?? []).filter((c) => c.kind === 'idea');
+  const curve = [...entries].reverse().reduce<number[]>((acc, e) => { acc.push((acc[acc.length - 1] ?? 0) + e.amount); return acc; }, [0]);
+  const curveMin = Math.min(...curve);
+  const curveMax = Math.max(...curve);
+  const curvePoints = curve.map((v, k) => {
+    const x = curve.length > 1 ? (k / (curve.length - 1)) * 240 : 0;
+    const y = 64 - ((v - curveMin) / (curveMax - curveMin || 1)) * 58;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const listening = wake || talking;
+  const headline = talking ? 'Lesson in progress' : wake ? 'Listening…' : 'Ready';
+
+  const setDone = async (task: FocusTask, done: boolean) => {
+    await send(`/v1/focus/task/${task.id}/done`, 'POST', { done }).catch(() => null);
+    if (done) setSay(`${task.title} is done. Well done.`);
+    await refresh();
+  };
+
+  // Brain dump: one box, then choose what the thought is.
+  const captureDump = async (e: FormEvent) => {
+    e.preventDefault();
+    const text = dumpText.trim();
+    if (!text) return;
+    setDumpText('');
+    if (dumpKind === 'task' || dumpKind === 'reminder') {
+      const res = await send('/v1/focus/command', 'POST', { text, pending: 'task' }).catch(() => null);
+      const out = res?.ok ? await res.json() as { say?: string } : null;
+      setSay(out?.say || 'I could not save that.');
+    } else {
+      await send('/v1/focus/capture', 'POST', { text, kind: dumpKind === 'idea' ? 'idea' : 'note' }).catch(() => null);
+      setSay(dumpKind === 'idea' ? 'Idea saved.' : 'Saved for later. Back to your step.');
+    }
+    await refresh();
+  };
+
+  const taskRow = (t: FocusTask) => (
+    <li key={t.id} className={t.overdue ? 'trow overdue' : 'trow'}>
+      <button className={t.done ? 'cb on' : 'cb'} onClick={() => void setDone(t, !t.done)} aria-label={t.done ? `Reopen ${t.title}` : `Mark ${t.title} done`}>{t.done && <Check size={13} />}</button>
+      <span className="tmain">
+        <span className={t.done ? 'struck' : ''}>{t.title}</span>
+        <small>{t.overdue ? `Overdue · ${fmtDue(t.due ?? '')}` : t.due ? fmtDue(t.due) : 'No date'}</small>
+      </span>
+      {t.overdue && <CircleAlert size={16} className="alert" />}
+      <button className="x" onClick={() => void remove(`/v1/focus/task/${t.id}`)} aria-label={`Remove ${t.title}`}><X size={13} /></button>
+    </li>
+  );
+
+  const ICONS: Record<string, typeof House> = {
+    overview: House, focus: Target, tasks: SquareCheck, ideas: Brain, calendar: CalendarDays, trading: ChartCandlestick,
+    car: Car, spanish: MessageCircleMore, jobs: BriefcaseBusiness, email: Mail, business: Layers,
+  };
+
+  const overview = (
+    <>
+      <div className="hero">
+        <button className="focus-card" onClick={toggleSprint}>
+          <Target size={30} />
+          <span><b>Focus Mode</b><small>{running ? 'Sprint running' : 'Deep Work'} • {fmtTimer(left)}</small></span>
+          <span className="play">{running ? <Pause size={18} /> : <Play size={18} />}</span>
+        </button>
+        <div className="orb-wrap">
+          <div className="orbbox"><canvas ref={canvasRef} aria-hidden="true" /></div>
+          <div className="status-card">
+            <button className="listen" onClick={toggleWake} disabled={!sttReady && !wake} title={wake ? `Stop listening for “Hey ${NAME}”` : `Listen for “Hey ${NAME}”`}>
+              <span className={listening ? 'led on' : 'led'} />
+              <b>{headline}</b>
+              {wake ? <Mic size={18} /> : <MicOff size={18} />}
+            </button>
+            <ul>
+              <li><CircleCheck size={15} /> {sttReady ? (wake ? `Say “Hey ${NAME}”` : 'Voice ready: click to listen') : 'Voice is loading'}</li>
+              <li><CircleCheck size={15} /> {dueToday.length} due today</li>
+              <li className={overdueCount ? 'alert' : ''}><TriangleAlert size={15} /> {overdueCount} overdue task{overdueCount === 1 ? '' : 's'}</li>
+            </ul>
+          </div>
+        </div>
+        <div className="quote">
+          <p>“Focus on the next right action. Progress compounds.”</p>
+          <small>— {NAME.toUpperCase()}</small>
+        </div>
+      </div>
+
+      <div className="askbar">
+        <form className="row" onSubmit={askTyped}>
+          <input id="focus-ask" value={ask} onChange={(e) => setAsk(e.target.value)} placeholder={`Tell ${NAME} what you need… e.g. add pick up laundry tomorrow at 3pm`} aria-label={`Message for ${NAME}`} autoComplete="off" />
+          <button className="primary" type="submit">Ask {NAME}</button>
+        </form>
+        <p className="say" aria-live="polite">{say}</p>
+        <div className="wake">
+          {wakeStatus && <span className="note" aria-live="polite">{wakeStatus}</span>}
+          <label className="check"><input id="focus-auto-listen" type="checkbox" checked={autoListen} onChange={(e) => changeAutoListen(e.target.checked)} /> Listen for “Hey {NAME}” when this page opens</label>
+        </div>
+      </div>
+
+      <div className="cards">
+        <section className="card">
+          <h2><CalendarDays size={20} /> Today <span>{now.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' })}</span></h2>
+          <h3>Top 3 Priorities</h3>
+          {priorities.length ? <ul className="tlist">{priorities.map(taskRow)}</ul> : <p className="note">Nothing open. Add a task or tell {NAME}.</p>}
+          <div className="session">
+            <span className="ringlet" />
+            <span><small>Focus Session</small><b>{fmtTimer(left)}</b></span>
+            <button className="play" onClick={toggleSprint} aria-label={running ? 'Pause sprint' : 'Start sprint'}>{running ? <Pause size={16} /> : <Play size={16} />}</button>
+          </div>
+          {current && (
+            <div className="nextstep">
+              <small>Your one next step</small>
+              <b>{current.steps[current.step]}</b>
+              <button className="small" onClick={() => void stepDone()}>Step done</button>
+            </div>
+          )}
+        </section>
+
+        <section className="card">
+          <h2><SquareCheck size={20} /> Tasks &amp; Reminders {overdueCount > 0 && <span className="badge">{overdueCount} Overdue</span>}</h2>
+          <div className="tabs">
+            {([['all', `All (${openTasks.length})`], ['today', `Today (${overdueTasks.length + dueToday.length})`], ['upcoming', `Upcoming (${upcoming.length})`], ['done', 'Done']] as const).map(([key, label]) => (
+              <button key={key} className={taskTab === key ? 'tab on' : 'tab'} onClick={() => setTaskTab(key)}>{label}</button>
+            ))}
+          </div>
+          {shownTasks.length ? <ul className="tlist scroll">{shownTasks.map(taskRow)}</ul> : <p className="note">Nothing here.</p>}
+          <form className="row addrow" onSubmit={addTask}>
+            <input id="focus-task" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Add a task" aria-label="New task" autoComplete="off" />
+            <input id="focus-due-date" type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} aria-label="Due date" />
+            <input id="focus-due" type="time" value={due} onChange={(e) => setDue(e.target.value)} aria-label="Due time" />
+            <button type="submit" disabled={adding} aria-label="Add task"><Plus size={15} /></button>
+          </form>
+        </section>
+
+        <section className="card">
+          <h2><Brain size={20} /> Brain Dump</h2>
+          <p className="note">Get it out of your head → into action.</p>
+          <form onSubmit={captureDump} className="dump">
+            <textarea id="focus-dump" value={dumpText} onChange={(e) => setDumpText(e.target.value)} placeholder="Ideas, tasks, worries, reminders… (type, or say “Hey Morpheus”)" aria-label="Brain dump" rows={2} />
+            <div className="chips">
+              {([['task', 'Task'], ['idea', 'Idea'], ['reminder', 'Reminder'], ['later', 'Later']] as const).map(([key, label]) => (
+                <button type="button" key={key} className={dumpKind === key ? 'chip on' : 'chip'} onClick={() => setDumpKind(key)}>+ {label}</button>
+              ))}
+            </div>
+            <button className="primary wide" type="submit">Capture &amp; Organize <Sparkles size={15} /></button>
+          </form>
+          <ul className="tlist scroll short">
+            {(state?.captures ?? []).slice(0, 4).map((c) => (
+              <li key={c.id} className="trow">
+                <span className="tmain"><span>{c.text}</span><small>{c.kind === 'idea' ? 'Idea' : 'Later'} · {c.at.slice(11, 16)}</small></span>
+                <button className="x" onClick={() => void remove(`/v1/focus/capture/${c.id}`)} aria-label="Remove"><X size={13} /></button>
+              </li>
+            ))}
+          </ul>
+        </section>
+
+        <section className="card">
+          <h2><CalendarDays size={20} /> Calendar <span>Next up</span></h2>
+          {schedule.length ? (
+            <ul className="agenda">
+              {schedule.map((t) => (
+                <li key={t.id} className={t.overdue ? 'overdue' : ''}>
+                  <time>{fmtDue(t.due ?? '')}</time>
+                  <span>{t.title}</span>
+                </li>
+              ))}
+            </ul>
+          ) : <p className="note">No dated tasks yet. Say “Hey {NAME}, add … for Friday at 3”.</p>}
+          <p className="note foot">Outlook and Google calendars are not connected yet.</p>
+        </section>
+
+        <section className="card">
+          <h2><Mail size={20} /> Email</h2>
+          <p className="empty">Not connected yet.</p>
+          <p className="note">Gmail, Yahoo and Outlook will show here once they are linked. Nothing is read or sent today.</p>
+        </section>
+
+        <section className="card">
+          <h2><ChartCandlestick size={20} /> Futures Trading <span className="badge soft">Manual</span></h2>
+          <div className="two">
+            <div>
+              <small>Today P&amp;L</small>
+              <b className={todayPnl < 0 ? 'big late' : 'big gain'}>{todayPnl > 0 ? '+' : ''}{money(todayPnl)}</b>
+              <svg className="spark" viewBox="0 0 240 70" preserveAspectRatio="none" aria-hidden="true">
+                {curve.length > 1 && <polyline points={curvePoints} fill="none" stroke="currentColor" strokeWidth="2" />}
+              </svg>
+              {curve.length <= 1 && <small>Record trade results to draw your curve.</small>}
+            </div>
+            <div>
+              <small>Risk per trade</small>
+              <b>{money(state?.risk_per_trade ?? 20)}</b>
+              <small style={{ marginTop: 8 }}>Latest call</small>
+              <span className="note">{state?.signals[0]?.say ?? 'Chart alerts are not connected.'}</span>
+            </div>
+          </div>
+          <form className="row addrow one" onSubmit={addGoalEntry}>
+            <input id="focus-goal-amount" type="number" step="0.01" value={goalAmount} onChange={(e) => setGoalAmount(e.target.value)} placeholder="Trade result, e.g. 45 or -20" aria-label="Trade result in dollars" />
+            <button type="submit">Record</button>
+          </form>
+          <p className="note foot">You place every trade. Results you record go toward {state?.goal.name ?? 'your goal'}.</p>
+        </section>
+
+        <section className="card">
+          <h2><Car size={20} /> {state?.goal.name ?? 'Car'} Goal</h2>
+          <div className="goalline"><b className="big">{money(state?.goal.saved ?? 0)}</b><span>/ {money(state?.goal.target ?? 0)}</span><em>{Math.round(goalPct)}%</em></div>
+          <div className="bar-track"><div className="bar-fill" style={{ width: `${goalPct}%` }} /></div>
+          <div className="kv"><span>Target</span><span>{money(state?.goal.target ?? 0)}</span></div>
+          <div className="kv"><span>Saved</span><span>{money(state?.goal.saved ?? 0)}</span></div>
+          <div className="kv"><span>From trading today</span><span className={todayPnl < 0 ? 'late' : 'gain'}>{todayPnl > 0 ? '+' : ''}{money(todayPnl)}</span></div>
+          <button className="linkbtn" onClick={() => setSection('car')}>Change the goal <ArrowRight size={14} /></button>
+        </section>
+
+        <section className="card">
+          <h2><MessageCircleMore size={20} /> Spanish Coach</h2>
+          <div className="two">
+            <div className="streak"><Flame size={20} /><b>{lesson?.progress.day_streak ?? 0}</b><small>Day Streak</small></div>
+            <div>
+              <small>Today’s Lesson</small>
+              <b>{lesson?.progress.unit ?? '…'}</b>
+              <small>{lesson ? `${lesson.progress.minutes_today}/${lesson.progress.goal_minutes} min · ${lesson.progress.words_mastered}/${lesson.progress.words_total} words` : ''}</small>
+            </div>
+          </div>
+          {talkStatus && <p className="note" aria-live="polite">{talkStatus}</p>}
+          {talking
+            ? <button className="primary wide" onClick={stopTalk}>Stop lesson</button>
+            : <button className="primary wide" onClick={() => startTalk('lesson')} disabled={micBusy || !sttReady}><Mic size={16} /> Start Speaking Practice</button>}
+          <button className="linkbtn" onClick={() => setSection('spanish')}>Open the cards <ArrowRight size={14} /></button>
+        </section>
+
+        <section className="card">
+          <h2><BriefcaseBusiness size={20} /> Job Hunt</h2>
+          <div className="kv row2"><span>Applications Sent</span><b>{sentJobs}</b></div>
+          <div className={openJobs.length ? 'kv row2 warnrow' : 'kv row2'}><span>Waiting for you</span><b>{openJobs.length}</b></div>
+          <p className="note">Automatic job search is not built yet.</p>
+          <button className="wide" onClick={() => setSection('jobs')}>Find &amp; Apply <ArrowRight size={15} /></button>
+        </section>
+
+        <section className="card">
+          <h2><Layers size={20} /> Build a Business</h2>
+          <small>Idea Queue ({ideas.length})</small>
+          {ideas.length ? (
+            <ul className="tlist short">{ideas.slice(0, 3).map((c) => <li key={c.id} className="trow"><Lightbulb size={14} /><span className="tmain"><span>{c.text}</span></span></li>)}</ul>
+          ) : <p className="note">Save a thought as an Idea in Brain Dump and it lands here.</p>}
+          <p className="note foot">Validation steps and revenue tracking are not built yet.</p>
+        </section>
+      </div>
+    </>
+  );
 
   return (
-    <div className="focus-hud" data-mode={mode} ref={rootRef}>
-      <aside className="sidebar">
-        <div className="logo">◉ {NAME.toUpperCase()}</div>
-        <div className="sub">PERSONAL SYSTEM · ON THIS MAC</div>
-        <nav className="navlist">
-          {NAV.map(([key, label]) => (
-            <button key={key} className={section === key ? 'nav active' : 'nav'} onClick={() => setSection(key)}>{label}</button>
-          ))}
-          <Link className="nav" to="/settings">⚙ Settings</Link>
-          <Link className="nav" to="/">☰ Chat</Link>
-        </nav>
-        <p className="note">Tasks, notes and voice stay on this Mac. Nothing here places trades or sends email. {BUILD}</p>
-      </aside>
-
-      <main className="main">
-        <div className="top">
-          <div>
-            <div className="eyebrow">Personal intelligence system</div>
-            <h1>COMMAND CENTER</h1>
-            <div className="muted">{now.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' })} · {now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</div>
-          </div>
-          <div className="topright">
-            <span><span className={offline ? 'dot off' : 'dot'} />{NAME} server: <b>{offline ? 'not reachable' : 'connected'}</b></span>
-            {soundOff && <span className="late">Sound is off: click anywhere on this page to turn it on</span>}
-            {voiceProblem && <span className="late">{voiceProblem}</span>}
-          </div>
+    <div className="focus-hud" data-mode={mode} data-section={section} data-voice={listening ? 'on' : 'off'} ref={rootRef}>
+      <div className="rain" aria-hidden="true" />
+      <header className="hdr">
+        <div className="brand">
+          <span className="ring" />
+          <div><div className="name">{NAME.toUpperCase()}</div><div className="tagname">Personal Command Center</div></div>
+          <span className="tagline">Your AI partner for focus, growth, and freedom</span>
         </div>
-
-        <div className="hero-banner">
-          <div>
-            <div className="tag">Your partner for focus, growth and freedom</div>
-            <strong>Good to see you. We focus on the next right action.</strong>
-            <div className="small-action">One priority at a time</div>
-          </div>
-          <div>
-            <button className={overdueCount ? 'overdue-badge hot' : 'overdue-badge'} onClick={() => setSection('tasks')}>{overdueCount} overdue</button>
-            <span className="micro-tag">{openCount} open</span>
-          </div>
+        <div className="hdr-right">
+          {soundOff && <span className="late">Sound is off: click anywhere to turn it on</span>}
+          {voiceProblem && <span className="late">{voiceProblem}</span>}
+          {offline && <span className="late">Server not reachable</span>}
+          <div className="clock2"><b>{now.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}</b><small>{now.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' })}</small></div>
+          <button className="bell" onClick={() => setSection('tasks')} aria-label={`${overdueCount} overdue tasks`}><Bell size={22} />{overdueCount > 0 && <i>{overdueCount}</i>}</button>
         </div>
+      </header>
 
-        <div className="panel command">
-          <form className="row" onSubmit={askTyped}>
-            <input id="focus-ask" value={ask} onChange={(e) => setAsk(e.target.value)} placeholder={`Tell ${NAME} what you need… e.g. add pick up laundry tomorrow`} aria-label={`Message for ${NAME}`} autoComplete="off" />
-            <button className="primary" type="submit">Ask {NAME}</button>
-            <button type="button" className={wake ? 'primary' : ''} onClick={toggleWake} disabled={!sttReady && !wake}>{wake ? `🎙 Hey ${NAME}: on` : `🎙 Hey ${NAME}: off`}</button>
-          </form>
-          <p className="say" aria-live="polite">{say}</p>
-          <div className="wake">
-            {wakeStatus && <span className="note" aria-live="polite">{wakeStatus}</span>}
-            {!sttReady && <span className="note">Speech recognition is loading.</span>}
-            <label className="check"><input id="focus-auto-listen" type="checkbox" checked={autoListen} onChange={(e) => changeAutoListen(e.target.checked)} /> Listen for “Hey {NAME}” when this page opens</label>
-          </div>
-        </div>
+      <div className="body">
+        <aside className="sidebar">
+          <nav className="navlist">
+            {NAV.map(([key, label]) => {
+              const Icon = ICONS[key];
+              return (
+                <button key={key} className={section === key ? 'nav active' : 'nav'} onClick={() => setSection(key)}>
+                  <Icon size={20} /> <span>{label}</span>
+                  {key === 'tasks' && overdueCount > 0 && <i>{overdueCount}</i>}
+                </button>
+              );
+            })}
+            <hr />
+            <Link className="nav" to="/settings"><Settings size={20} /> <span>Settings</span></Link>
+            <Link className="nav" to="/"><MessagesSquare size={20} /> <span>Chat</span></Link>
+          </nav>
+          <p className="note">Everything here stays on this Mac. {BUILD}</p>
+        </aside>
 
-        {section === 'overview' && (
-          <div className="grid12">
-            <div className="span4">{corePanel}</div>
-            <div className="span4">{tasksPanel}</div>
-            <div className="span4">{goalPanel}</div>
-            <div className="span6">{spanishPanel}</div>
-            <div className="span6">{tradesPanel}</div>
-            <div className="span6">{capturePanel}</div>
-            <div className="span6">{jobsPanel}</div>
-          </div>
-        )}
-        {section === 'tasks' && (
-          <div className="grid12">
-            <div className="span8">{tasksPanel}</div>
-            <div className="span4">{corePanel}</div>
-          </div>
-        )}
-        {section === 'ideas' && <div className="grid12"><div className="span12">{capturePanel}</div></div>}
-        {section === 'spanish' && <div className="grid12"><div className="span8">{spanishPanel}</div></div>}
-        {section === 'trading' && (
-          <div className="grid12">
-            <div className="span6">{tradesPanel}</div>
-            <div className="span6">{goalPanel}</div>
-          </div>
-        )}
-        {section === 'car' && <div className="grid12"><div className="span8">{goalPanel}</div></div>}
-        {section === 'jobs' && <div className="grid12"><div className="span12">{jobsPanel}</div></div>}
-        {section === 'calendar' && (
-          <div className="grid12">
-            <div className="span8">{tasksPanel}</div>
-            <div className="span4">{soon('Calendar', 'Outlook and Google calendars are not connected yet. For now your dated to-dos are your calendar.')}</div>
-          </div>
-        )}
-        {section === 'email' && <div className="grid12"><div className="span8">{soon('Email', 'Gmail, Yahoo and Outlook are not connected yet, so nothing is read, sorted or sent.')}</div></div>}
-        {section === 'business' && <div className="grid12"><div className="span8">{soon('Business builder', 'Not built yet. Ideas you capture are kept in Brain dump, tagged “idea”.')}</div></div>}
+        <main className="main">
+          {section === 'overview' && overview}
+          {section !== 'overview' && (
+            <div className="askbar">
+              <form className="row" onSubmit={askTyped}>
+                <input id="focus-ask" value={ask} onChange={(e) => setAsk(e.target.value)} placeholder={`Tell ${NAME} what you need…`} aria-label={`Message for ${NAME}`} autoComplete="off" />
+                <button className="primary" type="submit">Ask {NAME}</button>
+                <button type="button" className={wake ? 'primary' : ''} onClick={toggleWake} disabled={!sttReady && !wake}>{wake ? <Mic size={15} /> : <MicOff size={15} />} Hey {NAME}: {wake ? 'on' : 'off'}</button>
+              </form>
+              <p className="say" aria-live="polite">{say}</p>
+            </div>
+          )}
+          {section === 'focus' && <div className="grid12"><div className="span4">{corePanel}</div><div className="span8">{tasksPanel}</div></div>}
+          {section === 'tasks' && <div className="grid12"><div className="span8">{tasksPanel}</div><div className="span4">{corePanel}</div></div>}
+          {section === 'ideas' && <div className="grid12"><div className="span12">{capturePanel}</div></div>}
+          {section === 'spanish' && <div className="grid12"><div className="span8">{spanishPanel}</div></div>}
+          {section === 'trading' && <div className="grid12"><div className="span6">{tradesPanel}</div><div className="span6">{goalPanel}</div></div>}
+          {section === 'car' && <div className="grid12"><div className="span8">{goalPanel}</div></div>}
+          {section === 'jobs' && <div className="grid12"><div className="span12">{jobsPanel}</div></div>}
+          {section === 'calendar' && (
+            <div className="grid12">
+              <div className="span8">{tasksPanel}</div>
+              <div className="span4">{soon('Calendar', 'Outlook and Google calendars are not connected yet. For now your dated tasks are your calendar.')}</div>
+            </div>
+          )}
+          {section === 'email' && <div className="grid12"><div className="span8">{soon('Email', 'Gmail, Yahoo and Outlook are not connected yet, so nothing is read, sorted or sent.')}</div></div>}
+          {section === 'business' && <div className="grid12"><div className="span8">{soon('Business builder', 'Not built yet. Ideas you capture are kept in Brain Dump, tagged “idea”.')}</div></div>}
+        </main>
+      </div>
 
-        <div className="status-strip">
-          <span>● SYSTEM <b>{offline ? 'Offline' : 'Ready'}</b></span>
-          <span>◉ FOCUS <b>{running ? 'Sprint running' : 'Available'}</b></span>
-          <span>✓ TASKS <b>{openCount} open</b></span>
-          <span>▣ JOB HUNT <b>{openJobs.length} to do</b></span>
-          <span>◈ {state?.goal.name ?? 'Goal'} <b>{state ? money(state.goal.saved) : ''}</b></span>
-        </div>
-      </main>
+      <footer className="statusbar">
+        <span><i className={offline ? 'led' : 'led on'} /><b>System Status</b><small>{offline ? 'Server offline' : 'All systems ready'}</small></span>
+        <span><Target size={20} /><b>Focus</b><small>{running ? `Sprint ${fmtTimer(left)}` : 'Available'}</small></span>
+        <span><SquareCheck size={20} /><b>Tasks</b><small>{doneTasks.length} / {tasks.length} done</small></span>
+        <span><ChartNoAxesColumn size={20} /><b>Trading</b><small className={todayPnl < 0 ? 'late' : 'gain'}>{todayPnl > 0 ? '+' : ''}{money(todayPnl)} today</small></span>
+        <span><Car size={20} /><b>{state?.goal.name ?? 'Car'} Goal</b><small>{Math.round(goalPct)}% to target</small></span>
+        <span><GraduationCap size={20} /><b>Spanish</b><small>{lesson?.progress.day_streak ?? 0}-day streak</small></span>
+        <span><BriefcaseBusiness size={20} /><b>Job Hunt</b><small>{openJobs.length} waiting</small></span>
+        <span><Layers size={20} /><b>Business</b><small>{ideas.length} ideas</small></span>
+      </footer>
     </div>
   );
 }

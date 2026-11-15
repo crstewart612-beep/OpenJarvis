@@ -100,6 +100,18 @@ class FocusStore:
                     return task
         return None
 
+    def set_done(self, task_id: str, done: bool) -> Optional[Dict[str, Any]]:
+        """Tick a to-do off as a whole, or put it back."""
+        with self._lock:
+            data = self._load()
+            for task in data["tasks"]:
+                if task["id"] == task_id:
+                    task["done"] = done
+                    task["step"] = len(task["steps"]) if done else 0
+                    self._save(data)
+                    return task
+        return None
+
     def set_steps(self, task_id: str, steps: List[str]) -> bool:
         """Replace a task's steps, but only while it has not been started."""
         if not steps:
