@@ -44,6 +44,7 @@ def client(tmp_path):
     app.state.focus_store = FocusStore(tmp_path / "focus.json")
     app.state.engine = _Engine()
     app.state.model = "test"
+    app.state.focus_local_steps = True
     return TestClient(app)
 
 
@@ -455,6 +456,9 @@ def test_steered_transcription_uses_the_model_and_falls_back():
     assert text == "hola"
     assert model.calls[0]["initial_prompt"] == "hola, adiós"
     assert model.calls[0]["language"] == "es" and model.calls[0]["vad_filter"] is True
+    assert model.calls[0]["beam_size"] == 5
+    _steered_transcribe(Backend(model), b"abc", "mp4", "en", "", quick=True)
+    assert model.calls[-1]["beam_size"] == 1
     assert _steered_transcribe(Backend(None), b"abc", "mp4", "es", "") == "plain path"
 
 
@@ -468,3 +472,9 @@ def test_task_can_be_ticked_off_and_reopened(client):
     back = client.post(f"/v1/focus/task/{task['id']}/done", json={"done": False}).json()
     assert back["done"] is False and back["step"] == 0
     assert client.post("/v1/focus/task/nope/done", json={}).status_code == 404
+
+
+def test_no_step_breakdown_without_the_online_model(client):
+    client.app.state.focus_local_steps = False
+    task = client.post("/v1/focus/task", json={"title": "Send invoice"}).json()
+    assert task["steps"] == ["Send invoice"]

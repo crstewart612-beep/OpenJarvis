@@ -191,7 +191,19 @@ async def _complete(
     return (result.get("content") or "").strip()
 
 
+def _online(request: Request) -> bool:
+    from openjarvis.server import cloud_router
+
+    return bool(cloud_router._load_keys().get("ANTHROPIC_API_KEY"))
+
+
 async def _breakdown(request: Request, title: str) -> List[str]:
+    # The small local model is slow on a laptop and its steps are poor, and
+    # running it competes with speech recognition. Without the online model a
+    # to-do is simply its own single step.
+    local_ok = getattr(request.app.state, "focus_local_steps", False)
+    if not (_online(request) or local_ok):
+        return [title]
     try:
         text = await _complete(
             request,
@@ -430,7 +442,12 @@ async def _read_audio(request: Request) -> tuple:
 
 
 def _steered_transcribe(
-    backend, audio: bytes, ext: str, language: Optional[str], hint: str
+    backend,
+    audio: bytes,
+    ext: str,
+    language: Optional[str],
+    hint: str,
+    quick: bool = False,
 ) -> str:
     """Transcribe with settings suited to short phrases.
 
@@ -446,7 +463,13 @@ def _steered_transcribe(
             with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
                 tmp.write(audio)
                 path = tmp.name
-            options = {"beam_size": 5, "condition_on_previous_text": False}
+            # ``quick`` trades a little accuracy for speed: used for commands,
+            # where the wake word and a retry make a slip cheap.
+            options = {
+                "beam_size": 1 if quick else 5,
+                "condition_on_previous_text": False,
+                "without_timestamps": True,
+            }
             if language:
                 options["language"] = language
             if hint:
@@ -478,11 +501,12 @@ async def _run_stt(
     ext: str,
     language: Optional[str],
     hint: str = "",
+    quick: bool = False,
 ) -> str:
     try:
         backend = _stt(request)
         return await asyncio.to_thread(
-            _steered_transcribe, backend, audio, ext, language, hint
+            _steered_transcribe, backend, audio, ext, language, hint, quick
         )
     except Exception as exc:
         logger.exception("Focus transcription failed")
@@ -491,9 +515,11 @@ async def _run_stt(
         ) from exc
 
 
-async def _transcribe(request: Request, language: Optional[str], hint: str = "") -> str:
+async def _transcribe(
+    request: Request, language: Optional[str], hint: str = "", quick: bool = False
+) -> str:
     audio, ext = await _read_audio(request)
-    return await _run_stt(request, audio, ext, language, hint)
+    return await _run_stt(request, audio, ext, language, hint, quick)
 
 
 @focus_router.post("/listen/warm")
@@ -536,7 +562,7 @@ async def listen(request: Request):
     language = form.get("language")
     language = language if isinstance(language, str) and language else None
     hint = _COMMAND_HINT if language == "en" else ""
-    return {"text": await _transcribe(request, language, hint)}
+    return {"text": await _transcribe(request, language, hint, quick=True)}
 
 
 @focus_router.post("/spanish/say")
