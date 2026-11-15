@@ -15,6 +15,28 @@ class _Engine:
         return {"content": 'Sure:\n["Open mail", "Attach the PDF", "Press send"]'}
 
 
+@pytest.fixture(autouse=True)
+def _no_cloud_keys(monkeypatch):
+    from openjarvis.server import cloud_router
+
+    monkeypatch.setattr(cloud_router, "_load_keys", lambda: {})
+
+
+class _Heard:
+    def __init__(self, text):
+        self.text = text
+
+
+class _Stt:
+    def __init__(self, text):
+        self._text = text
+        self.calls = []
+
+    def transcribe(self, audio, *, format="wav", language=None):
+        self.calls.append((len(audio), format, language))
+        return _Heard(self._text)
+
+
 @pytest.fixture
 def client(tmp_path):
     app = FastAPI()
@@ -152,3 +174,86 @@ def test_spanish_lesson_flow(client):
         "/v1/focus/spanish/answer", json={"item_id": "nope:1", "action": "seen"}
     )
     assert bad.status_code == 400
+
+
+def test_listen_returns_text_and_validates(client):
+    client.app.state.focus_stt = _Stt(" hello there ")
+    r = client.post(
+        "/v1/focus/listen", files={"file": ("a.webm", b"abc", "audio/webm")}
+    )
+    assert r.json() == {"text": "hello there"}
+    assert client.app.state.focus_stt.calls == [(3, "webm", None)]
+    assert client.post("/v1/focus/listen", data={"x": "1"}).status_code == 400
+    empty = client.post(
+        "/v1/focus/listen", files={"file": ("a.webm", b"", "audio/webm")}
+    )
+    assert empty.status_code == 400
+
+
+def test_spanish_say_marks_progress_only_when_heard(client):
+    client.app.state.focus_stt = _Stt("Hola.")
+    files = {"file": ("a.mp4", b"abc", "audio/mp4")}
+    ok = client.post(
+        "/v1/focus/spanish/say", files=files, data={"item_id": "greetings:0"}
+    ).json()
+    assert ok["correct"] is True and ok["heard"] == "Hola."
+    assert client.app.state.focus_stt.calls[0][2] == "es"
+    client.app.state.focus_stt = _Stt("ola k ase")
+    miss = client.post(
+        "/v1/focus/spanish/say", files=files, data={"item_id": "greetings:1"}
+    ).json()
+    assert miss["correct"] is False and miss["es"] == "buenos días"
+    bad = client.post("/v1/focus/spanish/say", files=files, data={"item_id": "x"})
+    assert bad.status_code == 400
+
+
+def test_spanish_converse_parses_tutor_reply(client):
+    class Tutor:
+        def __init__(self):
+            self.prompts = []
+
+        def generate(self, messages, *, model, **kwargs):
+            self.prompts.append(messages[0].content)
+            return {
+                "content": 'ok {"say": "¡Hola! ¿Cómo estás?", "meaning": '
+                '"Hello! How are you?", "correction": "Say: buenos días."}'
+            }
+
+    tutor = Tutor()
+    client.app.state.engine = tutor
+    out = client.post(
+        "/v1/focus/spanish/converse",
+        json={"text": "bueno dia", "history": [{"role": "tutor", "text": "Hola"}]},
+    ).json()
+    assert out["say"] == "¡Hola! ¿Cómo estás?"
+    assert out["meaning"] == "Hello! How are you?"
+    assert out["correction"] == "Say: buenos días."
+    assert "Learner: bueno dia" in tutor.prompts[0]
+    assert "Tutor: Hola" in tutor.prompts[0]
+
+
+def test_parse_tutor_falls_back_to_plain_text():
+    from openjarvis.server.focus_routes import parse_tutor
+
+    assert parse_tutor("Hola, ¿qué tal?") == {
+        "say": "Hola, ¿qué tal?",
+        "meaning": "",
+        "correction": "",
+    }
+
+
+def test_online_model_is_used_when_a_key_is_saved(client, monkeypatch):
+    from openjarvis.server import cloud_router
+
+    seen = {}
+
+    async def fake_stream(model, messages, temperature=0.7, max_tokens=1024):
+        seen["model"] = model
+        for part in ('["Open', ' mail"]'):
+            yield part
+
+    monkeypatch.setattr(cloud_router, "_load_keys", lambda: {"ANTHROPIC_API_KEY": "k"})
+    monkeypatch.setattr(cloud_router, "stream_cloud", fake_stream)
+    task = client.post("/v1/focus/task", json={"title": "Send invoice"}).json()
+    assert task["steps"] == ["Open mail"]
+    assert seen["model"].startswith("claude-")

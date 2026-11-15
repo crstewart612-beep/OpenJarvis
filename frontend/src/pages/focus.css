@@ -91,6 +91,13 @@
   .fb { margin: 8px 0 0; font-size: 13px; text-align: center; }
   .fb.ok { color: var(--ok); }
   .fb.bad { color: var(--hot); }
+  .talk { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .talk .note { margin: 0; text-align: center; }
+  .turns li { flex-direction: column; gap: 2px; align-items: flex-start; font-size: 13px; }
+  .turns li.you { border-left-color: var(--accent); }
+  .turns li .m { white-space: normal; }
+  .turns .fix { color: var(--warn); font-size: 12px; }
+  button:disabled { opacity: 0.5; cursor: default; }
   .struck { text-decoration: line-through; opacity: 0.6; }
   @media (max-width: 900px) {
     .grid { grid-template-columns: minmax(0, 1fr); }

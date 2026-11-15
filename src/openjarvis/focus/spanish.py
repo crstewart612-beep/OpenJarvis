@@ -278,7 +278,7 @@ def answer(
     text: str = "",
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Apply one response. ``action``: seen, answer, skip or skip_unit."""
+    """Apply one response. ``action``: seen, answer, spoken, skip, skip_unit."""
     if item_id not in _ITEMS:
         raise ValueError(f"Unknown item: {item_id}")
     item = _ITEMS[item_id]
@@ -288,6 +288,10 @@ def answer(
     result: Dict[str, Any] = {"correct": None, "es": item["es"], "en": item["en"]}
     if action == "seen":
         rec["seen"] = True
+    elif action == "spoken":
+        rec["seen"] = True
+        rec["streak"] = min(MASTERED, rec["streak"] + 1)
+        result["correct"] = True
     elif action == "skip":
         rec.update(seen=True, streak=MASTERED)
     elif action == "skip_unit":
@@ -305,6 +309,28 @@ def answer(
     else:
         raise ValueError(f"Unknown action: {action}")
     return result
+
+
+def heard_matches(item_id: str, heard: str) -> bool:
+    """True when the recognised speech contains the item's Spanish."""
+    expected = normalize(_ITEMS[item_id]["es"])
+    said = normalize(heard)
+    return bool(said) and f" {expected} " in f" {said} "
+
+
+def known_phrases(state: Dict[str, Any], limit: int = 60) -> List[str]:
+    """Spanish the learner has met so far, for keeping conversation simple."""
+    seen = [
+        _ITEMS[i]["es"]
+        for i, rec in state.get("items", {}).items()
+        if rec.get("seen") and i in _ITEMS
+    ]
+    return seen[-limit:]
+
+
+def touch(state: Dict[str, Any], now: Optional[datetime] = None) -> None:
+    """Count practice time for activity that is not a card answer."""
+    _add_time(state, now or datetime.now())
 
 
 def progress(state: Dict[str, Any], today: Optional[date] = None) -> Dict[str, Any]:

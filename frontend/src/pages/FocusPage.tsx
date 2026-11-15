@@ -57,19 +57,118 @@ async function send(path: string, method: string, body?: unknown): Promise<Respo
 }
 
 let audio: HTMLAudioElement | null = null;
+/** Speak text in one of the voices. Resolves when playback has finished. */
 async function speak(text: string, mode: 'calm' | 'deadline' | 'es'): Promise<void> {
   try {
     const res = await send('/v1/focus/speak', 'POST', { text, mode });
     if (!res.ok) return;
     const url = URL.createObjectURL(await res.blob());
     audio?.pause();
-    audio = new Audio(url);
-    audio.onended = () => URL.revokeObjectURL(url);
-    await audio.play();
+    const player = new Audio(url);
+    audio = player;
+    await new Promise<void>((resolve) => {
+      const finish = () => { URL.revokeObjectURL(url); resolve(); };
+      player.onended = finish;
+      player.onerror = finish;
+      player.onpause = finish;
+      player.play().catch(finish);
+    });
   } catch {
     // Voice is optional: the screen still shows the same words.
   }
 }
+
+interface Mic { stream: MediaStream; ctx: AudioContext; analyser: AnalyserNode }
+let mic: Mic | null = null;
+
+async function openMic(): Promise<Mic> {
+  if (mic) return mic;
+  if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
+    throw new Error('This browser is not giving this page a microphone.');
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true },
+  });
+  const Ctx: typeof AudioContext = window.AudioContext
+    ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  const ctx = new Ctx();
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 1024;
+  ctx.createMediaStreamSource(stream).connect(analyser);
+  mic = { stream, ctx, analyser };
+  return mic;
+}
+
+function closeMic(): void {
+  mic?.stream.getTracks().forEach((t) => t.stop());
+  void mic?.ctx.close().catch(() => {});
+  mic = null;
+}
+
+interface Recording { blob: Blob; ext: string }
+
+/**
+ * Record one spoken phrase. Starts recording at once so the first syllable is
+ * kept, and stops after a pause. Returns null when nobody spoke.
+ */
+async function recordUtterance(opts: {
+  waitMs: number; silenceMs: number; maxMs: number; cancelled?: () => boolean;
+}): Promise<Recording | null> {
+  const m = await openMic();
+  if (m.ctx.state === 'suspended') await m.ctx.resume();
+  const mime = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4'].find((t) => MediaRecorder.isTypeSupported(t));
+  const rec = new MediaRecorder(m.stream, mime ? { mimeType: mime } : undefined);
+  const chunks: Blob[] = [];
+  rec.ondataavailable = (e) => { if (e.data.size) chunks.push(e.data); };
+  const stopped = new Promise<void>((resolve) => { rec.onstop = () => resolve(); });
+  rec.start();
+  const buf = new Float32Array(m.analyser.fftSize);
+  const t0 = performance.now();
+  let loudTicks = 0;
+  let spoke = false;
+  let lastLoud = t0;
+  await new Promise<void>((resolve) => {
+    const tick = () => {
+      m.analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (const v of buf) sum += v * v;
+      const now = performance.now();
+      if (Math.sqrt(sum / buf.length) > 0.02) {
+        loudTicks += 1;
+        lastLoud = now;
+        if (loudTicks >= 3) spoke = true;
+      } else if (!spoke) {
+        loudTicks = 0;
+      }
+      const stop = opts.cancelled?.()
+        || (!spoke && now - t0 > opts.waitMs)
+        || (spoke && now - lastLoud > opts.silenceMs)
+        || now - t0 > opts.maxMs;
+      if (stop) resolve(); else setTimeout(tick, 50);
+    };
+    tick();
+  });
+  rec.stop();
+  await stopped;
+  if (!spoke || opts.cancelled?.()) return null;
+  const type = rec.mimeType || mime || 'audio/webm';
+  return { blob: new Blob(chunks, { type }), ext: type.includes('mp4') ? 'mp4' : 'webm' };
+}
+
+function audioForm(rec: Recording, fields: Record<string, string> = {}): FormData {
+  const form = new FormData();
+  form.append('file', rec.blob, `speech.${rec.ext}`);
+  for (const [k, v] of Object.entries(fields)) form.append(k, v);
+  return form;
+}
+
+async function errorDetail(res: Response | null, fallback: string): Promise<string> {
+  if (!res) return 'The Jarvis server did not answer.';
+  const body = await res.json().catch(() => ({}));
+  return typeof body.detail === 'string' ? body.detail : fallback;
+}
+
+interface TalkTurn { role: 'you' | 'tutor'; text: string; meaning?: string; correction?: string }
 
 export function FocusPage() {
   const [state, setState] = useState<FocusState | null>(null);
@@ -87,6 +186,11 @@ export function FocusPage() {
   const [lesson, setLesson] = useState<SpanishLesson | null>(null);
   const [typed, setTyped] = useState('');
   const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
+  const [talking, setTalking] = useState(false);
+  const [talkStatus, setTalkStatus] = useState('');
+  const [turns, setTurns] = useState<TalkTurn[]>([]);
+  const [micBusy, setMicBusy] = useState(false);
+  const talkRef = useRef(false);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const leftRef = useRef(left);
@@ -120,6 +224,8 @@ export function FocusPage() {
     const clock = setInterval(() => setNow(new Date()), 10000);
     return () => { clearInterval(poll); clearInterval(clock); };
   }, [refresh]);
+
+  useEffect(() => () => { talkRef.current = false; closeMic(); }, []);
 
   // Sprint countdown.
   useEffect(() => {
@@ -314,6 +420,89 @@ export function FocusPage() {
     setLesson({ card: data.card, progress: data.progress });
   };
 
+  // Say the card aloud and have it checked against what was heard.
+  const sayCard = async () => {
+    const card = lesson?.card;
+    if (!card || micBusy || talking) return;
+    setMicBusy(true);
+    setFeedback({ ok: true, text: 'Listening… say it now.' });
+    try {
+      const rec = await recordUtterance({ waitMs: 6000, silenceMs: 900, maxMs: 9000 });
+      if (!rec) { setFeedback({ ok: false, text: 'I did not hear anything. Try again, a little louder.' }); return; }
+      setFeedback({ ok: true, text: 'Checking…' });
+      const res = await apiFetch('/v1/focus/spanish/say', { method: 'POST', body: audioForm(rec, { item_id: card.item_id }) }).catch(() => null);
+      if (!res?.ok) { setFeedback({ ok: false, text: await errorDetail(res, 'I could not check that.') }); return; }
+      const data = await res.json();
+      setLesson({ card: data.card, progress: data.progress });
+      if (data.correct) {
+        setFeedback({ ok: true, text: `I heard "${data.heard}". That is right.` });
+      } else {
+        setFeedback({ ok: false, text: `I heard "${data.heard || 'nothing clear'}". Listen, then try again: ${data.es}` });
+        await speak(data.es, 'es');
+      }
+    } catch (err) {
+      setFeedback({ ok: false, text: err instanceof Error ? err.message : 'The microphone is not available.' });
+    } finally {
+      closeMic();
+      setMicBusy(false);
+    }
+  };
+
+  // Hands-free conversation: Jarvis speaks, listens, corrects, and repeats.
+  const runTalk = async () => {
+    let history: TalkTurn[] = [];
+    const push = (turn: TalkTurn) => { history = [...history, turn].slice(-12); setTurns(history); };
+    const converse = async (text: string) => {
+      setTalkStatus('Thinking…');
+      const res = await send('/v1/focus/spanish/converse', 'POST', {
+        text, history: history.map(({ role, text: t }) => ({ role, text: t })),
+      }).catch(() => null);
+      if (!res?.ok) throw new Error(await errorDetail(res, 'The tutor could not answer.'));
+      return res.json() as Promise<{ say: string; meaning: string; correction: string; progress: SpanishProgress }>;
+    };
+    try {
+      await openMic();
+      let reply = await converse('');
+      let said = '';
+      while (talkRef.current) {
+        if (said) push({ role: 'you', text: said, correction: reply.correction });
+        push({ role: 'tutor', text: reply.say, meaning: reply.meaning });
+        setLesson((cur) => (cur ? { ...cur, progress: reply.progress } : cur));
+        setTalkStatus('Speaking…');
+        if (said && reply.correction) await speak(reply.correction, 'calm');
+        if (!talkRef.current) break;
+        await speak(reply.say, 'es');
+        said = '';
+        while (talkRef.current && !said) {
+          setTalkStatus('Listening… your turn.');
+          const rec = await recordUtterance({ waitMs: 20000, silenceMs: 1100, maxMs: 15000, cancelled: () => !talkRef.current });
+          if (!rec) continue;
+          setTalkStatus('Working out what you said…');
+          const res = await apiFetch('/v1/focus/listen', { method: 'POST', body: audioForm(rec) }).catch(() => null);
+          if (!res?.ok) throw new Error(await errorDetail(res, 'I could not hear that.'));
+          said = ((await res.json()).text as string).trim();
+        }
+        if (!talkRef.current) break;
+        reply = await converse(said);
+      }
+      setTalkStatus('');
+    } catch (err) {
+      setTalkStatus(err instanceof Error ? err.message : 'The conversation stopped.');
+    } finally {
+      talkRef.current = false;
+      setTalking(false);
+      closeMic();
+    }
+  };
+
+  const toggleTalk = () => {
+    if (talking) { talkRef.current = false; audio?.pause(); setTalkStatus('Stopping…'); return; }
+    talkRef.current = true;
+    setTalking(true);
+    setTurns([]);
+    void runTalk();
+  };
+
   const toggleSprint = () => {
     if (!running && left === 0) setLeft(SPRINT_SECONDS);
     if (!running) setSay('Sprint started. Just this one step.');
@@ -446,6 +635,7 @@ export function FocusPage() {
                       )}
                       <div className="row" style={{ justifyContent: 'center' }}>
                         {lesson.card.kind !== 'type' && <button className="small" onClick={() => void speak(lesson.card!.es, 'es')}>Hear it</button>}
+                        {lesson.card.kind !== 'choose' && <button className="small" onClick={() => void sayCard()} disabled={micBusy || talking}>{micBusy ? 'Listening…' : 'Say it'}</button>}
                         {lesson.card.kind === 'intro' && <button className="small primary" onClick={() => void spanishAnswer('seen')}>Got it</button>}
                         <button className="small" onClick={() => void spanishAnswer('skip')}>I know this</button>
                         <button className="small" onClick={() => void spanishAnswer('skip_unit')}>Skip unit</button>
@@ -455,6 +645,21 @@ export function FocusPage() {
                     <p className="note" style={{ margin: '8px 0 0' }}>Every unit is mastered. More units are not written yet.</p>
                   )}
                   {feedback && <p className={feedback.ok ? 'fb ok' : 'fb bad'} aria-live="polite">{feedback.text}</p>}
+                  <div className="talk">
+                    <button className={talking ? 'primary' : ''} onClick={toggleTalk} disabled={micBusy}>{talking ? 'Stop talking' : 'Talk with Jarvis'}</button>
+                    {talkStatus && <p className="note" aria-live="polite">{talkStatus}</p>}
+                    {turns.length > 0 && (
+                      <ul className="turns">
+                        {turns.slice(-4).map((t, i) => (
+                          <li key={`${i}-${t.text}`} className={t.role}>
+                            <span><b>{t.role === 'you' ? 'You' : 'Jarvis'}:</b> {t.text}</span>
+                            {t.meaning && <span className="m">{t.meaning}</span>}
+                            {t.correction && <span className="fix">{t.correction}</span>}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
                 </>
               ) : (
                 <p className="note" style={{ margin: 0 }}>Lesson not loaded.</p>

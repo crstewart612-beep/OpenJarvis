@@ -88,6 +88,16 @@ class SpanishAnswerBody(BaseModel):
     text: str = Field(default="", max_length=200)
 
 
+class ConverseTurn(BaseModel):
+    role: str = Field(pattern=r"^(you|tutor)$")
+    text: str = Field(max_length=600)
+
+
+class ConverseBody(BaseModel):
+    text: str = Field(default="", max_length=600)
+    history: List[ConverseTurn] = Field(default_factory=list, max_length=12)
+
+
 class SpeakBody(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
     mode: str = "calm"
@@ -118,21 +128,58 @@ def parse_steps(text: str) -> List[str]:
     return [ln for ln in lines if ln][:8]
 
 
-def _breakdown(request: Request, title: str) -> List[str]:
+# Online model used when an Anthropic key is saved in the app's Cloud Models
+# settings. Without a key the local model answers instead.
+CLOUD_MODEL = os.environ.get("OPENJARVIS_FOCUS_MODEL", "claude-haiku-5-5")
+
+
+class NoModelError(RuntimeError):
+    """Neither an online key nor a local model is available."""
+
+
+async def _complete(
+    request: Request, prompt: str, *, temperature: float, max_tokens: int
+) -> str:
+    """One model reply: the online model when a key is saved, else local."""
+    from openjarvis.core.types import Message, Role
+    from openjarvis.server import cloud_router
+
+    messages = [Message(role=Role.USER, content=prompt)]
+    if cloud_router._load_keys().get("ANTHROPIC_API_KEY"):
+        try:
+            parts = []
+            async for token in cloud_router.stream_cloud(
+                CLOUD_MODEL, messages, temperature=temperature, max_tokens=max_tokens
+            ):
+                parts.append(token)
+            text = "".join(parts).strip()
+            if text:
+                return text
+        except Exception:
+            logger.exception("Online model call failed; trying the local model")
     engine = getattr(request.app.state, "engine", None)
     model = getattr(request.app.state, "model", None)
     if engine is None or not model:
-        return [title]
-    from openjarvis.core.types import Message, Role
+        raise NoModelError("No model is configured")
+    result = await asyncio.to_thread(
+        engine.generate,
+        messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return (result.get("content") or "").strip()
 
+
+async def _breakdown(request: Request, title: str) -> List[str]:
     try:
-        result = engine.generate(
-            [Message(role=Role.USER, content=_BREAKDOWN_PROMPT.format(title=title))],
-            model=model,
+        text = await _complete(
+            request,
+            _BREAKDOWN_PROMPT.format(title=title),
             temperature=0.2,
             max_tokens=300,
         )
-        return parse_steps(result.get("content") or "") or [title]
+        return parse_steps(text) or [title]
     except Exception:
         logger.exception("Task breakdown failed; using the task as a single step")
         return [title]
@@ -148,7 +195,7 @@ async def add_task(request: Request, body: TaskBody):
     title = body.title.strip()
     steps = [s.strip() for s in (body.steps or []) if s.strip()]
     if not steps:
-        steps = await asyncio.to_thread(_breakdown, request, title)
+        steps = await _breakdown(request, title)
     return _store(request).add_task(title, steps, body.due)
 
 
@@ -210,13 +257,7 @@ _COVER_PROMPT = (
 )
 
 
-def _draft_cover(request: Request, job: dict, resume: str) -> str:
-    engine = getattr(request.app.state, "engine", None)
-    model = getattr(request.app.state, "model", None)
-    if engine is None or not model:
-        raise HTTPException(status_code=503, detail="No model is configured")
-    from openjarvis.core.types import Message, Role
-
+async def _draft_cover(request: Request, job: dict, resume: str) -> str:
     prompt = _COVER_PROMPT.format(
         title=job["title"],
         company=job.get("company") or "the company",
@@ -224,16 +265,12 @@ def _draft_cover(request: Request, job: dict, resume: str) -> str:
         resume=resume[:12000],
     )
     try:
-        result = engine.generate(
-            [Message(role=Role.USER, content=prompt)],
-            model=model,
-            temperature=0.4,
-            max_tokens=400,
-        )
+        text = await _complete(request, prompt, temperature=0.4, max_tokens=400)
+    except NoModelError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Cover note draft failed")
         raise HTTPException(status_code=502, detail="The model call failed") from exc
-    text = (result.get("content") or "").strip()
     if not text:
         raise HTTPException(status_code=502, detail="The model returned nothing")
     return text
@@ -266,7 +303,7 @@ async def draft_job(request: Request, job_id: str):
     resume = store.job_profile().get("resume") or ""
     if not resume:
         raise HTTPException(status_code=409, detail="Add your resume first")
-    draft = await asyncio.to_thread(_draft_cover, request, job, resume)
+    draft = await _draft_cover(request, job, resume)
     return store.update_job(job_id, draft=draft, status="drafted")
 
 
@@ -301,6 +338,145 @@ async def spanish_answer(request: Request, body: SpanishAnswerBody):
         "card": spanish.next_card(state),
         "progress": spanish.progress(state),
     }
+
+
+_MAX_AUDIO_BYTES = 8 * 1024 * 1024
+
+
+def _stt(request: Request):
+    """Speech recognition, created on first use so it never slows startup."""
+    app = request.app
+    backend = getattr(app.state, "speech_backend", None)
+    backend = backend or getattr(app.state, "focus_stt", None)
+    if backend is None:
+        from openjarvis.speech.faster_whisper import FasterWhisperBackend
+
+        backend = FasterWhisperBackend(
+            model_size=os.environ.get("OPENJARVIS_FOCUS_STT_MODEL", "base"),
+            device="auto",
+            compute_type="int8",
+        )
+        app.state.focus_stt = backend
+    return backend
+
+
+async def _transcribe(request: Request, language: Optional[str]) -> str:
+    form = await request.form()
+    upload = form.get("file")
+    if upload is None or not hasattr(upload, "read"):
+        raise HTTPException(status_code=400, detail="Missing 'file' field")
+    audio = await upload.read()
+    if not audio:
+        raise HTTPException(status_code=400, detail="The recording was empty")
+    if len(audio) > _MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="The recording is too long")
+    filename = getattr(upload, "filename", "") or "audio.wav"
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "wav"
+    if not re.fullmatch(r"[a-z0-9]{1,5}", ext):
+        ext = "wav"
+    try:
+        backend = _stt(request)
+        result = await asyncio.to_thread(
+            backend.transcribe, audio, format=ext, language=language
+        )
+    except Exception as exc:
+        logger.exception("Focus transcription failed")
+        raise HTTPException(
+            status_code=503, detail="Speech recognition is not available"
+        ) from exc
+    return (result.text or "").strip()
+
+
+@focus_router.post("/listen")
+async def listen(request: Request):
+    """Turn a short recording into text. The audio is not kept."""
+    form = await request.form()
+    language = form.get("language")
+    language = language if isinstance(language, str) and language else None
+    return {"text": await _transcribe(request, language)}
+
+
+@focus_router.post("/spanish/say")
+async def spanish_say(request: Request):
+    """Check a spoken attempt at the current card against what was heard."""
+    form = await request.form()
+    item_id = form.get("item_id")
+    if not isinstance(item_id, str) or item_id not in spanish._ITEMS:
+        raise HTTPException(status_code=400, detail="Unknown item")
+    heard = await _transcribe(request, "es")
+    state = _spanish_state(request)
+    correct = spanish.heard_matches(item_id, heard)
+    if correct:
+        spanish.answer(state, item_id, "spoken")
+        _store(request).save_section("spanish", state)
+    item = spanish._ITEMS[item_id]
+    return {
+        "heard": heard,
+        "correct": correct,
+        "es": item["es"],
+        "en": item["en"],
+        "card": spanish.next_card(state),
+        "progress": spanish.progress(state),
+    }
+
+
+_TUTOR_PROMPT = (
+    "You are a warm, patient Spanish tutor for an absolute beginner who lives "
+    "in Mexico. The learner talks to you by voice, so their text is a speech "
+    "recognition transcript and may contain recognition mistakes.\n"
+    "Reply with only a JSON object with three string fields:\n"
+    '"say": your reply in very simple Mexican Spanish, at most 12 words, '
+    "ending with an easy question that keeps the conversation going.\n"
+    '"meaning": the English translation of "say".\n'
+    '"correction": one short English sentence about the learner\'s last '
+    "message: if they made a mistake, give the right way to say it in "
+    "Spanish; if they spoke English, give the Spanish for what they said; if "
+    "it was fine, an empty string.\n"
+    "Prefer words the learner already knows: {known}.\n\n"
+    "Conversation so far:\n{history}\n\nLearner: {text}"
+)
+
+
+def parse_tutor(text: str) -> dict:
+    """Pull the tutor's three fields out of a model reply."""
+    match = re.search(r"\{.*\}", text or "", re.DOTALL)
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict) and str(data.get("say", "")).strip():
+                return {
+                    key: str(data.get(key, "")).strip()
+                    for key in ("say", "meaning", "correction")
+                }
+        except ValueError:
+            pass
+    return {"say": (text or "").strip()[:300], "meaning": "", "correction": ""}
+
+
+@focus_router.post("/spanish/converse")
+async def spanish_converse(request: Request, body: ConverseBody):
+    """One turn of spoken Spanish practice: a reply plus a correction."""
+    state = _spanish_state(request)
+    known = ", ".join(spanish.known_phrases(state)) or "hola, gracias"
+    history = "\n".join(
+        f"{'Learner' if turn.role == 'you' else 'Tutor'}: {turn.text}"
+        for turn in body.history
+    )
+    prompt = _TUTOR_PROMPT.format(
+        known=known,
+        history=history or "(nothing yet)",
+        text=body.text.strip() or "(The learner has just sat down. Greet them.)",
+    )
+    try:
+        reply = await _complete(request, prompt, temperature=0.5, max_tokens=300)
+    except NoModelError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Tutor reply failed")
+        raise HTTPException(status_code=502, detail="The model call failed") from exc
+    spanish.touch(state)
+    _store(request).save_section("spanish", state)
+    return {**parse_tutor(reply), "progress": spanish.progress(state)}
 
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}

@@ -93,3 +93,21 @@ def test_every_unit_has_enough_items_for_choices():
     for unit in spanish.UNITS:
         assert len(unit["items"]) >= 4
         assert len({i["en"] for i in unit["items"]}) == len(unit["items"])
+
+
+def test_heard_matches_ignores_accents_and_extra_words():
+    assert spanish.heard_matches("greetings:1", "Buenos dias.")
+    assert spanish.heard_matches("greetings:0", "eh, hola!")
+    assert not spanish.heard_matches("greetings:0", "ola")
+    assert not spanish.heard_matches("greetings:0", "")
+
+
+def test_spoken_counts_as_correct_and_known_phrases():
+    state = spanish.new_state()
+    out = spanish.answer(state, "greetings:0", "spoken")
+    assert out["correct"] is True
+    assert state["items"]["greetings:0"] == {"streak": 1, "seen": True}
+    for _ in range(5):
+        spanish.answer(state, "greetings:0", "spoken")
+    assert state["items"]["greetings:0"]["streak"] == spanish.MASTERED
+    assert spanish.known_phrases(state) == ["hola"]
