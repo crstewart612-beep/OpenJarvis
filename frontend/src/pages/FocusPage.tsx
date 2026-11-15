@@ -36,6 +36,8 @@ interface SpanishProgress {
 interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
+// Shown in the top bar so a screenshot tells which version is running.
+const BUILD = 'build 15';
 const SPRINT_SECONDS = 15 * 60;
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const CALM_LINE = "Take a breath. One thing at a time. I'm right here with you.";
@@ -86,6 +88,10 @@ function unlockAudio(): void {
   }
 }
 
+function audioLocked(): boolean {
+  return !out || out.state !== 'running';
+}
+
 function stopSpeaking(): void {
   try { playing?.stop(); } catch { /* already stopped */ }
   playing = null;
@@ -109,15 +115,21 @@ async function speak(text: string, mode: 'calm' | 'deadline' | 'es', signal?: Ab
       spoken.set(key, buffer);
     }
     if (signal?.aborted) return;
-    if (out.state === 'suspended') await out.resume();
+    // Never wait forever on sound: a browser that has not been clicked yet
+    // can leave resume() pending, which would freeze whatever is speaking.
+    if (out.state !== 'running') await Promise.race([out.resume(), sleep(1200)]);
+    if (out.state !== 'running') return;
     stopSpeaking();
     const node = out.createBufferSource();
     node.buffer = buffer;
     node.connect(out.destination);
     playing = node;
     await new Promise<void>((resolve) => {
-      node.onended = () => { if (playing === node) playing = null; resolve(); };
-      signal?.addEventListener('abort', () => { try { node.stop(); } catch { resolve(); } }, { once: true });
+      const done = () => { if (playing === node) playing = null; resolve(); };
+      node.onended = done;
+      // Safety net in case the browser never reports the end of playback.
+      setTimeout(done, buffer.duration * 1000 + 1500);
+      signal?.addEventListener('abort', () => { try { node.stop(); } catch { done(); } }, { once: true });
       node.start();
     });
   } catch {
@@ -737,7 +749,11 @@ export function FocusPage() {
         pending = out.pending || '';
         awakeUntil = out.intent === 'none' || pending ? Date.now() + 15000 : 0;
         setWakeStatus(`Heard: ${out.heard}`);
-        if (out.say) { setSay(out.say); await speak(out.say, 'calm'); }
+        if (out.say) {
+          setSay(out.say);
+          if (audioLocked()) setWakeStatus('Click anywhere on the page so I can speak.');
+          await speak(out.say, 'calm');
+        }
         await refresh();
         if (out.action === 'sprint') actionsRef.current.startSprint();
         if (out.action === 'step_done') actionsRef.current.stepDone();
@@ -826,7 +842,7 @@ export function FocusPage() {
         <div className="top">
           <span className="brand">FOCUS HUD</span>
           <span><span className={offline ? 'dot off' : 'dot'} />Jarvis server: <b>{offline ? 'not reachable' : 'connected'}</b></span>
-          <span>Tasks, notes and voice stay on this Mac</span>
+          <span>Tasks, notes and voice stay on this Mac · {BUILD}</span>
           <Link className="btn" to="/">Chat</Link>
         </div>
 

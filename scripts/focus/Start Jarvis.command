@@ -6,8 +6,11 @@ export UV_HTTP_TIMEOUT=600
 PORT=5173
 
 echo "Checking for updates..."
-git -C "$HOME/.openjarvis/src" pull --ff-only --quiet 2>/dev/null \
-  || echo "(Could not check for updates; starting the version you have.)"
+if git -C "$HOME/.openjarvis/src" pull --ff-only --quiet; then
+  echo "Up to date: version $(git -C "$HOME/.openjarvis/src" log -1 --format=%h)"
+else
+  echo "(Could not update; starting the version you already have.)"
+fi
 
 echo "Stopping any earlier copy..."
 # Only the program serving the page, not browsers that are connected to it.
