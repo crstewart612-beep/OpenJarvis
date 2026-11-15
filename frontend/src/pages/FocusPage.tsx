@@ -45,7 +45,7 @@ interface MailState { available: boolean; unread: number; accounts: { name: stri
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 24';
+const BUILD = 'build 25';
 // What the assistant is called on screen and out loud.
 const NAME = 'Morpheus';
 const NAV: [string, string][] = [
@@ -382,6 +382,9 @@ export function FocusPage() {
   const [keyNote, setKeyNote] = useState('');
   const [cal, setCal] = useState<CalState | null>(null);
   const [mail, setMail] = useState<MailState | null>(null);
+  const [plans, setPlans] = useState<{ name: string; why: string; steps: string[] }[]>([]);
+  const [bizNote, setBizNote] = useState('');
+  const [bizBusy, setBizBusy] = useState(false);
   const [jobNote, setJobNote] = useState('');
   const [jobBusy, setJobBusy] = useState(false);
   const [jobTitles, setJobTitles] = useState('');
@@ -427,6 +430,8 @@ export function FocusPage() {
       if (cl.ok) setCal(await cl.json());
       const ml = await send('/v1/focus/mail', 'GET');
       if (ml.ok) setMail(await ml.json());
+      const bz = await send('/v1/focus/business', 'GET');
+      if (bz.ok) setPlans((await bz.json()).plans ?? []);
     } catch {
       setOffline(true);
     }
@@ -1022,6 +1027,23 @@ export function FocusPage() {
   const removeKey = async () => {
     const res = await send('/v1/focus/key', 'PUT', { key: '' }).catch(() => null);
     if (res?.ok) { setOnline(await res.json()); setKeyNote('Key removed.'); }
+  };
+
+  // ---- business builder ----
+  const suggestBusinesses = async () => {
+    setBizBusy(true);
+    setBizNote('Thinking about what fits you…');
+    const res = await send('/v1/focus/business/suggest', 'POST').catch(() => null);
+    setBizBusy(false);
+    if (!res?.ok) { setBizNote(await errorDetail(res, 'The suggestions did not arrive.')); return; }
+    setPlans((await res.json()).plans ?? []);
+    setBizNote('These are suggestions to test, not promises of income.');
+  };
+
+  const stepToTask = async (step: string) => {
+    await send('/v1/focus/task', 'POST', { title: step, steps: [step] }).catch(() => null);
+    setBizNote(`Added to your tasks: ${step}`);
+    await refresh();
   };
 
   // ---- job hunt ----
@@ -1686,8 +1708,8 @@ export function FocusPage() {
           {ideas.length ? (
             <ul className="tlist short">{ideas.slice(0, 3).map((c) => <li key={c.id} className="trow"><Lightbulb size={14} /><span className="tmain"><span>{c.text}</span></span></li>)}</ul>
           ) : <p className="note">Save a thought as an Idea in Brain Dump and it lands here.</p>}
-          <div className="kv row2"><span>Next Step</span><span className="note">Not built yet</span></div>
-          <div className="kv row2"><span>Revenue</span><span className="note">Not tracked yet</span></div>
+          <div className="kv row2"><span>Next Step</span><span className="note">{plans[0]?.steps[0] ?? 'Open Business Builder'}</span></div>
+          <button className="wide" onClick={() => setSection('business')}>Open Business Builder <ArrowRight size={15} /></button>
         </section>
       </div>
     </>
@@ -1889,7 +1911,30 @@ export function FocusPage() {
               </div>
             </div></div>
           )}
-          {section === 'business' && <div className="grid12"><div className="span8">{soon('Business builder', 'Not built yet. Ideas you capture are kept in Brain Dump, tagged “idea”.')}</div></div>}
+          {section === 'business' && (
+            <div className="grid12"><div className="span8">
+              <div className="panel">
+                <h2>Business Builder <span>{ideas.length} idea{ideas.length === 1 ? '' : 's'} saved</span></h2>
+                <p className="note">Suggestions come from your resume and the ideas you have saved in Brain Dump.</p>
+                <div className="row" style={{ margin: '10px 0' }}>
+                  <button className="primary" onClick={() => void suggestBusinesses()} disabled={bizBusy || !online?.configured}>{bizBusy ? 'Thinking…' : plans.length ? 'Suggest again' : 'Suggest businesses for me'}</button>
+                </div>
+                {!online?.configured && <p className="note">This needs the online model key.</p>}
+                {bizNote && <p className="note" aria-live="polite">{bizNote}</p>}
+                {plans.map((plan) => (
+                  <div key={plan.name} className="plan">
+                    <b>{plan.name}</b>
+                    <p className="note">{plan.why}</p>
+                    <ul>
+                      {plan.steps.map((step) => (
+                        <li key={step}><span>{step}</span><button className="small" onClick={() => void stepToTask(step)}>Add as task</button></li>
+                      ))}
+                    </ul>
+                  </div>
+                ))}
+              </div>
+            </div></div>
+          )}
         </main>
       </div>
 

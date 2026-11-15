@@ -774,3 +774,27 @@ def test_resume_upload_and_job_search(client, monkeypatch):
     assert [j["company"] for j in jobs] == ["Acme"]
     bad = client.post("/v1/focus/jobs/resume", files={"file": ("cv.pdf", b"x" * 80)})
     assert bad.status_code == 400
+
+
+def test_business_suggestions_need_a_resume_and_are_saved(client, monkeypatch):
+    from openjarvis.server import cloud_router, focus_routes
+
+    async def fake_claude(api_key, prompt):
+        assert "candle shop" in prompt and "My CV text" in prompt
+        return (
+            '[{"name": "Process clinics", "why": "Fits their background.", '
+            '"steps": ["Write a one-page offer", "Message five contacts"]}, {"why": "no name"}]'
+        )
+
+    monkeypatch.setattr(cloud_router, "_load_keys", lambda: {"ANTHROPIC_API_KEY": "k"})
+    monkeypatch.setattr(focus_routes, "_claude", fake_claude)
+    assert client.post("/v1/focus/business/suggest").status_code == 409
+    client.put("/v1/focus/jobs/profile", json={"resume": "My CV text " * 10})
+    client.post("/v1/focus/capture", json={"text": "candle shop", "kind": "idea"})
+    out = client.post("/v1/focus/business/suggest").json()
+    assert [p["name"] for p in out["plans"]] == ["Process clinics"]
+    assert out["plans"][0]["steps"] == [
+        "Write a one-page offer",
+        "Message five contacts",
+    ]
+    assert client.get("/v1/focus/business").json() == out

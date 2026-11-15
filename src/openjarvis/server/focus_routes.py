@@ -741,6 +741,68 @@ async def search_jobs(request: Request):
     return {"added": added, "found": len(found) if isinstance(found, list) else 0}
 
 
+_BUSINESS_PROMPT = (
+    "Suggest three small businesses or paid services this person could start "
+    "alone, online, with little money, based on the resume and their own "
+    "ideas below. For each give: name (a few words), why (one sentence on why "
+    "it fits them), and steps (three small first actions that test whether "
+    "people will pay, each doable in under an hour). Do not promise income. "
+    "Reply with only a JSON array of objects with the fields name, why, steps."
+    "\n\nTHEIR IDEAS:\n{ideas}\n\nRESUME:\n{resume}"
+)
+
+
+@focus_router.get("/business")
+async def business_plans(request: Request):
+    return _store(request).section("business") or {"plans": []}
+
+
+@focus_router.post("/business/suggest")
+async def suggest_businesses(request: Request):
+    """Ask the online model for business ideas that fit the saved resume."""
+    _local_only(request)
+    api_key = _api_key()
+    if not api_key:
+        raise HTTPException(status_code=409, detail="Add the online model key first")
+    store = _store(request)
+    resume = store.job_profile().get("resume") or ""
+    if not resume:
+        raise HTTPException(
+            status_code=409, detail="Load your resume on the Job Hunt page"
+        )
+    ideas = [c["text"] for c in store.snapshot()["captures"] if c.get("kind") == "idea"]
+    prompt = _BUSINESS_PROMPT.format(
+        ideas="\n".join(f"- {i}" for i in ideas[:20]) or "(none yet)",
+        resume=resume[:12000],
+    )
+    try:
+        reply = await _claude(api_key, prompt)
+        match = re.search(r"\[.*\]", reply, re.DOTALL)
+        raw = json.loads(match.group(0)) if match else []
+    except Exception as exc:
+        logger.exception("Business suggestions failed")
+        raise HTTPException(
+            status_code=502, detail="The suggestions did not arrive"
+        ) from exc
+    plans = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict) or not str(item.get("name", "")).strip():
+            continue
+        steps = item.get("steps") if isinstance(item.get("steps"), list) else []
+        plans.append(
+            {
+                "name": str(item["name"]).strip()[:120],
+                "why": str(item.get("why", "")).strip()[:400],
+                "steps": [str(x).strip()[:200] for x in steps if str(x).strip()][:5],
+            }
+        )
+    if not plans:
+        raise HTTPException(status_code=502, detail="No usable suggestions came back")
+    data = {"plans": plans[:5]}
+    store.save_section("business", data)
+    return data
+
+
 @focus_router.post("/jobs")
 async def queue_job(request: Request, body: JobBody):
     return _store(request).add_job(body.model_dump())
