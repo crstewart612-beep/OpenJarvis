@@ -4,6 +4,8 @@ from openjarvis.focus.signals import (
     CONTRACTS,
     evaluate,
     max_stop_points,
+    normalize_symbol,
+    plan_trade,
     position_size,
 )
 
@@ -56,3 +58,36 @@ def test_signal_that_does_not_fit_risk_is_wait():
     assert sig.action == "wait"
     assert sig.contracts == 0
     assert "limit" in sig.reason
+
+
+def test_normalize_symbol():
+    assert normalize_symbol("MES1!") == "MES"
+    assert normalize_symbol("CME_MINI:MNQZ2026") == "MNQ"
+    with pytest.raises(ValueError):
+        normalize_symbol("NES")
+
+
+def test_plan_trade_long_within_risk():
+    plan = plan_trade("MES1!", "long", 5000.0, 2.0, 20)
+    assert plan["action"] == "long"
+    assert plan["contracts"] == 1
+    assert plan["stop_points"] == 3.0
+    assert plan["stop"] == 4997.0
+    assert plan["target"] == 5006.0
+    assert plan["trail_at"] == 5003.0
+    assert plan["risk_dollars"] == 15.0
+
+
+def test_plan_trade_short_mirrors_levels():
+    plan = plan_trade("MYM", "short", 40000, 10, 20)
+    assert plan["contracts"] == 2
+    assert plan["stop"] == 40015
+    assert plan["target"] == 39970
+    assert plan["risk_dollars"] == 15.0
+
+
+def test_plan_trade_waits_when_stop_exceeds_risk():
+    plan = plan_trade("MES", "long", 5000.0, 4.0, 20)
+    assert plan["action"] == "wait"
+    assert plan["contracts"] == 0
+    assert "Skip" in plan["say"]

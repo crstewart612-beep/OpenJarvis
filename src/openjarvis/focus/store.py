@@ -40,6 +40,7 @@ class FocusStore:
             data = {}
         data.setdefault("tasks", [])
         data.setdefault("captures", [])
+        data.setdefault("signals", [])
         data.setdefault("risk_per_trade", DEFAULT_RISK_PER_TRADE)
         return data
 
@@ -100,6 +101,19 @@ class FocusStore:
         with self._lock:
             data = self._load()
             data["captures"].insert(0, item)
+            self._save(data)
+        return item
+
+    def add_signal(
+        self, signal: Dict[str, Any], now: Optional[datetime] = None
+    ) -> Dict[str, Any]:
+        """Keep the newest signal per symbol, newest first."""
+        now = now or datetime.now()
+        item = {**signal, "id": _new_id(), "at": now.isoformat(timespec="seconds")}
+        with self._lock:
+            data = self._load()
+            rest = [s for s in data["signals"] if s.get("symbol") != item["symbol"]]
+            data["signals"] = [item] + rest
             self._save(data)
         return item
 

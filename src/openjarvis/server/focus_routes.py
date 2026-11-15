@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
+import os
 import re
 from typing import List, Optional
 
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
-from openjarvis.focus.signals import CONTRACTS, max_stop_points
+from openjarvis.focus.signals import (
+    CONTRACTS,
+    max_stop_points,
+    normalize_symbol,
+    plan_trade,
+)
 from openjarvis.focus.store import FocusStore
 
 logger = logging.getLogger(__name__)
@@ -45,6 +52,14 @@ class CaptureBody(BaseModel):
 
 class RiskBody(BaseModel):
     risk_per_trade: float = Field(gt=0, le=100000)
+
+
+class AlertBody(BaseModel):
+    symbol: str = Field(min_length=1, max_length=40)
+    side: str
+    price: float = Field(gt=0)
+    atr: Optional[float] = Field(default=None, gt=0)
+    token: Optional[str] = None
 
 
 class SpeakBody(BaseModel):
@@ -160,6 +175,50 @@ async def sizing(request: Request):
             }
         )
     return {"risk_per_trade": risk, "feed_connected": False, "contracts": rows}
+
+
+_LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+
+def _alert_allowed(request: Request, token: Optional[str]) -> bool:
+    """Chart alerts need the shared token, or must come from this machine."""
+    expected = os.environ.get("OPENJARVIS_FOCUS_ALERT_TOKEN", "")
+    if expected:
+        return hmac.compare_digest(expected, token or "")
+    host = request.client.host if request.client else ""
+    return host in _LOOPBACK
+
+
+@focus_router.post("/alert")
+async def chart_alert(request: Request, body: AlertBody):
+    """Receive an entry or exit alert from the trader's own chart.
+
+    Advisory only: the reply says what to do; no order is placed.
+    """
+    if not _alert_allowed(request, body.token):
+        raise HTTPException(status_code=403, detail="Alert token missing or wrong")
+    store = _store(request)
+    try:
+        symbol = normalize_symbol(body.symbol)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    side = body.side.lower()
+    if side == "exit":
+        signal = {
+            "symbol": symbol,
+            "side": "exit",
+            "action": "exit",
+            "price": body.price,
+            "say": f"{symbol}: get out now, near {body.price:g}.",
+        }
+    elif side in ("long", "short"):
+        if body.atr is None:
+            raise HTTPException(status_code=400, detail="Entry alerts need 'atr'")
+        risk = float(store.snapshot()["risk_per_trade"])
+        signal = plan_trade(symbol, side, body.price, body.atr, risk)
+    else:
+        raise HTTPException(status_code=400, detail="side must be long, short or exit")
+    return store.add_signal(signal)
 
 
 @focus_router.post("/speak")

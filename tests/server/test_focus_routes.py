@@ -68,3 +68,27 @@ def test_sizing_uses_risk_limit(client):
     client.put("/v1/focus/risk", json={"risk_per_trade": 25})
     mes = client.get("/v1/focus/sizing").json()["contracts"][0]
     assert mes["max_stop_points"] == 5.0
+
+
+def test_chart_alert_becomes_sized_signal(client):
+    body = {"symbol": "MES1!", "side": "long", "price": 5000, "atr": 2}
+    sig = client.post("/v1/focus/alert", json=body).json()
+    assert sig["action"] == "long" and sig["contracts"] == 1 and sig["stop"] == 4997
+    out = client.post(
+        "/v1/focus/alert", json={"symbol": "MES", "side": "exit", "price": 5004}
+    ).json()
+    assert out["action"] == "exit"
+    signals = client.get("/v1/focus/state").json()["signals"]
+    assert [s["action"] for s in signals] == ["exit"]
+
+
+def test_chart_alert_validation_and_token(client, monkeypatch):
+    bad = {"symbol": "NES", "side": "long", "price": 1, "atr": 1}
+    assert client.post("/v1/focus/alert", json=bad).status_code == 400
+    no_atr = {"symbol": "MES", "side": "long", "price": 1}
+    assert client.post("/v1/focus/alert", json=no_atr).status_code == 400
+    monkeypatch.setenv("OPENJARVIS_FOCUS_ALERT_TOKEN", "s3cret")
+    ok = {"symbol": "MES", "side": "exit", "price": 5000}
+    assert client.post("/v1/focus/alert", json=ok).status_code == 403
+    ok["token"] = "s3cret"
+    assert client.post("/v1/focus/alert", json=ok).status_code == 200

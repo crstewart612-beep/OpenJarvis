@@ -13,9 +13,11 @@ interface FocusTask {
   overdue: boolean;
 }
 interface FocusCapture { id: string; text: string; at: string }
+interface FocusSignal { id: string; symbol: string; action: 'long' | 'short' | 'exit' | 'wait'; say: string; at: string }
 interface FocusState {
   tasks: FocusTask[];
   captures: FocusCapture[];
+  signals: FocusSignal[];
   current: FocusTask | null;
   mode: 'calm' | 'deadline';
   risk_per_trade: number;
@@ -69,6 +71,7 @@ export function FocusPage() {
   const rootRef = useRef<HTMLDivElement>(null);
   const leftRef = useRef(left);
   const lastMode = useRef<string>('calm');
+  const lastSignal = useRef<string | null>(null);
   leftRef.current = left;
 
   const mode = state?.mode ?? 'calm';
@@ -121,6 +124,18 @@ export function FocusPage() {
     setSay(line);
     void speak(line, mode);
   }, [mode, current]);
+
+  // Read a new trade call aloud once. Calls already on screen at load stay silent.
+  const newestSignal = state?.signals[0];
+  useEffect(() => {
+    if (!state) return;
+    const id = newestSignal?.id ?? '';
+    if (lastSignal.current === null) { lastSignal.current = id; return; }
+    if (!newestSignal || id === lastSignal.current) return;
+    lastSignal.current = id;
+    setSay(newestSignal.say);
+    void speak(newestSignal.say, newestSignal.action === 'exit' ? 'deadline' : 'calm');
+  }, [state, newestSignal]);
 
   // The orb.
   useEffect(() => {
@@ -336,7 +351,7 @@ export function FocusPage() {
 
           <div className="col">
             <div className="panel">
-              <h2>Trade sizing <span>you place every trade</span></h2>
+              <h2>Trades <span>you place every trade</span></h2>
               <div className="kv">
                 <span>Most you can lose per trade ($)</span>
                 <input id="focus-risk" type="number" min="1" step="1" key={state?.risk_per_trade} defaultValue={state?.risk_per_trade ?? 20}
@@ -350,7 +365,24 @@ export function FocusPage() {
                   </li>
                 ))}
               </ul>
-              <p className="note" style={{ margin: '10px 0 0' }}>Live market feed: not connected yet, so no entry or exit calls</p>
+              <h2 style={{ marginTop: 12 }}>Latest calls <span>from your chart alerts</span></h2>
+              {state?.signals.length ? (
+                <ul>
+                  {state.signals.map((g) => (
+                    <li key={g.id} style={{ flexDirection: 'column', gap: 2 }}>
+                      <span className="end">
+                        <span className={`pill ${g.action === 'exit' ? 'hot' : g.action === 'wait' ? 'warn' : 'ok'}`}>
+                          {g.action === 'long' || g.action === 'short' ? `go ${g.action}` : g.action === 'exit' ? 'get out' : 'skip'}
+                        </span>
+                        <span className="m">{g.at.slice(11, 16)}</span>
+                      </span>
+                      <span>{g.say}</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="note" style={{ margin: 0 }}>No calls yet. Chart alerts are not connected.</p>
+              )}
             </div>
             <div className="panel">
               <h2>Job hunt</h2>

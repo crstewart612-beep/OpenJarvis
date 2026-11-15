@@ -1,0 +1,29 @@
+//@version=5
+// Focus HUD signal: sends entry alerts from your own chart to the Focus HUD.
+// The HUD works out contracts, stop and target from your risk limit.
+// Advisory only. Create one alert per chart with "Any alert() function call".
+indicator("Focus HUD signal", overlay = true)
+
+fastLen = input.int(9, "Fast average")
+slowLen = input.int(21, "Slow average")
+token   = input.string("", "Focus HUD token")
+
+fast = ta.ema(close, fastLen)
+slow = ta.ema(close, slowLen)
+atr  = ta.atr(14)
+
+goLong  = ta.crossover(fast, slow)
+goShort = ta.crossunder(fast, slow)
+
+plot(fast, "Fast", color = color.aqua)
+plot(slow, "Slow", color = color.orange)
+plotshape(goLong, "Long", shape.triangleup, location.belowbar, color.green, size = size.small)
+plotshape(goShort, "Short", shape.triangledown, location.abovebar, color.red, size = size.small)
+
+payload(side) =>
+    '{"symbol":"' + syminfo.root + '","side":"' + side + '","price":' + str.tostring(close) + ',"atr":' + str.tostring(atr) + ',"token":"' + token + '"}'
+
+if goLong
+    alert(payload("long"), alert.freq_once_per_bar_close)
+if goShort
+    alert(payload("short"), alert.freq_once_per_bar_close)

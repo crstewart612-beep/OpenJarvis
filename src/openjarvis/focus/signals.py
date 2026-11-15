@@ -130,3 +130,73 @@ def evaluate(
         stop_points=stop,
         risk_dollars=round(contracts * stop * c.point_value, 2),
     )
+
+
+def normalize_symbol(raw: str) -> str:
+    """Map chart tickers such as ``MES1!`` or ``MNQZ2026`` to a known root."""
+    text = (raw or "").upper().split(":")[-1]
+    for root in CONTRACTS:
+        if text.startswith(root):
+            return root
+    raise ValueError(f"Unknown contract: {raw}")
+
+
+def _round_to_tick(price: float, tick: float) -> float:
+    return round(round(price / tick) * tick, 4)
+
+
+def plan_trade(
+    symbol: str,
+    side: str,
+    price: float,
+    atr_points: float,
+    risk_dollars: float,
+    *,
+    atr_mult: float = 1.5,
+    reward_mult: float = 2.0,
+) -> Dict[str, object]:
+    """Turn an entry alert into contracts, stop, target and a trailing rule.
+
+    The stop sits ``atr_mult`` average ranges from the entry. If one contract
+    at that stop would lose more than ``risk_dollars`` the plan says "wait".
+    """
+    c = _contract(normalize_symbol(symbol))
+    if side not in ("long", "short"):
+        raise ValueError(f"Unknown side: {side}")
+    ticks = max(1, math.ceil(atr_points * atr_mult / c.tick_size - 1e-9))
+    stop_points = round(ticks * c.tick_size, 4)
+    contracts = position_size(c.symbol, risk_dollars, stop_points)
+    per_contract = round(stop_points * c.point_value, 2)
+    plan: Dict[str, object] = {
+        "symbol": c.symbol,
+        "side": side,
+        "price": price,
+        "stop_points": stop_points,
+        "contracts": contracts,
+    }
+    if contracts == 0:
+        plan["action"] = "wait"
+        plan["say"] = (
+            f"{c.symbol} gave a {side} signal, but the stop needs "
+            f"${per_contract:.2f} per contract and your limit is "
+            f"${risk_dollars:.2f}. Skip this one."
+        )
+        return plan
+    sign = 1 if side == "long" else -1
+    stop = _round_to_tick(price - sign * stop_points, c.tick_size)
+    target = _round_to_tick(price + sign * stop_points * reward_mult, c.tick_size)
+    trail_at = _round_to_tick(price + sign * stop_points, c.tick_size)
+    plan.update(
+        action=side,
+        stop=stop,
+        target=target,
+        trail_at=trail_at,
+        risk_dollars=round(contracts * per_contract, 2),
+        say=(
+            f"{c.symbol}: go {side}, {contracts} contract"
+            f"{'s' if contracts != 1 else ''} near {price:g}. Stop at {stop:g}, "
+            f"target {target:g}. When price reaches {trail_at:g}, move your "
+            f"stop to your entry and trail it from there."
+        ),
+    )
+    return plan

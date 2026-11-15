@@ -80,6 +80,7 @@
   .pill { font-family: var(--mono); font-size: 10px; border: 1px solid currentColor; border-radius: 99px; padding: 1px 8px; white-space: nowrap; }
   .pill.ok { color: var(--ok); }
   .pill.hot { color: var(--hot); }
+  .pill.warn { color: var(--warn); }
   .late { color: var(--hot); }
   .struck { text-decoration: line-through; opacity: 0.6; }
   @media (max-width: 900px) {
