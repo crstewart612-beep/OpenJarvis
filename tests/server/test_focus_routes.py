@@ -783,7 +783,8 @@ def test_business_suggestions_need_a_resume_and_are_saved(client, monkeypatch):
         assert "candle shop" in prompt and "My CV text" in prompt
         return (
             '[{"name": "Process clinics", "why": "Fits their background.", '
-            '"steps": ["Write a one-page offer", "Message five contacts"]}, {"why": "no name"}]'
+            '"steps": ["Write a one-page offer", "Message five contacts"]}, '
+            '{"why": "no name"}]'
         )
 
     monkeypatch.setattr(cloud_router, "_load_keys", lambda: {"ANTHROPIC_API_KEY": "k"})
