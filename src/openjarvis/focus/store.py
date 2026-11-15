@@ -59,6 +59,7 @@ class FocusStore:
             data = self._load()
         for task in data["tasks"]:
             task["overdue"] = _is_overdue(task, now)
+        data.pop("sections", None)
         profile = data["job_profile"]
         profile["has_resume"] = bool(profile.pop("resume", ""))
         open_tasks = [t for t in data["tasks"] if not t["done"]]
@@ -161,6 +162,17 @@ class FocusStore:
                     self._save(data)
                     return job
         return None
+
+    def section(self, key: str) -> Optional[Dict[str, Any]]:
+        """A named sub-state kept out of the main snapshot (e.g. lessons)."""
+        with self._lock:
+            return self._load().get("sections", {}).get(key)
+
+    def save_section(self, key: str, value: Dict[str, Any]) -> None:
+        with self._lock:
+            data = self._load()
+            data.setdefault("sections", {})[key] = value
+            self._save(data)
 
     def remove_capture(self, capture_id: str) -> bool:
         return self._remove("captures", capture_id)

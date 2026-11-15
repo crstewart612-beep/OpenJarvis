@@ -25,6 +25,12 @@ interface FocusState {
   mode: 'calm' | 'deadline';
   risk_per_trade: number;
 }
+interface SpanishCard { item_id: string; unit: string; es: string; en: string; kind: 'intro' | 'choose' | 'type'; choices?: string[] }
+interface SpanishProgress {
+  words_mastered: number; words_total: number; minutes_today: number; goal_minutes: number; day_streak: number;
+  unit: string; unit_number: number; unit_count: number; unit_mastered?: number; unit_total?: number;
+}
+interface SpanishLesson { card: SpanishCard | null; progress: SpanishProgress }
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 const SPRINT_SECONDS = 15 * 60;
@@ -44,7 +50,7 @@ async function send(path: string, method: string, body?: unknown): Promise<Respo
 }
 
 let audio: HTMLAudioElement | null = null;
-async function speak(text: string, mode: 'calm' | 'deadline'): Promise<void> {
+async function speak(text: string, mode: 'calm' | 'deadline' | 'es'): Promise<void> {
   try {
     const res = await send('/v1/focus/speak', 'POST', { text, mode });
     if (!res.ok) return;
@@ -70,6 +76,9 @@ export function FocusPage() {
   const [due, setDue] = useState('');
   const [capture, setCapture] = useState('');
   const [adding, setAdding] = useState(false);
+  const [lesson, setLesson] = useState<SpanishLesson | null>(null);
+  const [typed, setTyped] = useState('');
+  const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const leftRef = useRef(left);
@@ -90,6 +99,8 @@ export function FocusPage() {
       setState(await s.json());
       setSizing((await z.json()).contracts);
       setOffline(false);
+      const sp = await send('/v1/focus/spanish', 'GET');
+      if (sp.ok) setLesson(await sp.json());
     } catch {
       setOffline(true);
     }
@@ -285,6 +296,19 @@ export function FocusPage() {
   const openJobs = state?.jobs.filter((j) => j.status === 'found' || j.status === 'drafted') ?? [];
   const sentJobs = state?.jobs.filter((j) => j.status === 'submitted').length ?? 0;
 
+  const spanishAnswer = async (action: 'seen' | 'answer' | 'skip' | 'skip_unit', text = '') => {
+    const card = lesson?.card;
+    if (!card) return;
+    const res = await send('/v1/focus/spanish/answer', 'POST', { item_id: card.item_id, action, text }).catch(() => null);
+    if (!res?.ok) { setFeedback({ ok: false, text: 'Could not save that answer.' }); return; }
+    const data = await res.json();
+    setTyped('');
+    if (data.result.correct === true) setFeedback({ ok: true, text: `Correct: ${data.result.es} = ${data.result.en}` });
+    else if (data.result.correct === false) setFeedback({ ok: false, text: `Not yet: ${data.result.es} = ${data.result.en}` });
+    else setFeedback(null);
+    setLesson({ card: data.card, progress: data.progress });
+  };
+
   const toggleSprint = () => {
     if (!running && left === 0) setLeft(SPRINT_SECONDS);
     if (!running) setSay('Sprint started. Just this one step.');
@@ -382,6 +406,54 @@ export function FocusPage() {
           </div>
 
           <div className="col">
+            <div className="panel">
+              <h2>Spanish <span>{lesson ? `unit ${lesson.progress.unit_number} of ${lesson.progress.unit_count}` : ''}</span></h2>
+              {lesson ? (
+                <>
+                  <div className="kv"><span>{lesson.progress.unit}</span><span>{lesson.progress.unit_total ? `${lesson.progress.unit_mastered}/${lesson.progress.unit_total}` : 'done'}</span></div>
+                  <div className="kv"><span>Today</span><span>{lesson.progress.minutes_today}/{lesson.progress.goal_minutes} min</span></div>
+                  <div className="kv"><span>Day streak · words learned</span><span>{lesson.progress.day_streak} · {lesson.progress.words_mastered}/{lesson.progress.words_total}</span></div>
+                  {lesson.card ? (
+                    <div className="lesson">
+                      {lesson.card.kind === 'type' ? (
+                        <>
+                          <div className="now-label">Type it in Spanish</div>
+                          <div className="word">{lesson.card.en}</div>
+                          <form className="row" onSubmit={(e) => { e.preventDefault(); if (typed.trim()) void spanishAnswer('answer', typed); }}>
+                            <input id="focus-spanish" value={typed} onChange={(e) => setTyped(e.target.value)} placeholder="Accents are optional" aria-label="Your answer in Spanish" autoComplete="off" autoCapitalize="off" spellCheck={false} />
+                            <button type="submit">Check</button>
+                          </form>
+                        </>
+                      ) : (
+                        <>
+                          <div className="now-label">{lesson.card.kind === 'intro' ? 'New' : 'What does it mean?'}</div>
+                          <div className="word">{lesson.card.es}</div>
+                          {lesson.card.kind === 'intro' && <div className="task">{lesson.card.en}</div>}
+                          {lesson.card.kind === 'choose' && (
+                            <div className="choices">
+                              {lesson.card.choices?.map((c) => (
+                                <button key={c} onClick={() => void spanishAnswer('answer', c)}>{c}</button>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                      <div className="row" style={{ justifyContent: 'center' }}>
+                        {lesson.card.kind !== 'type' && <button className="small" onClick={() => void speak(lesson.card!.es, 'es')}>Hear it</button>}
+                        {lesson.card.kind === 'intro' && <button className="small primary" onClick={() => void spanishAnswer('seen')}>Got it</button>}
+                        <button className="small" onClick={() => void spanishAnswer('skip')}>I know this</button>
+                        <button className="small" onClick={() => void spanishAnswer('skip_unit')}>Skip unit</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="note" style={{ margin: '8px 0 0' }}>Every unit is mastered. More units are not written yet.</p>
+                  )}
+                  {feedback && <p className={feedback.ok ? 'fb ok' : 'fb bad'} aria-live="polite">{feedback.text}</p>}
+                </>
+              ) : (
+                <p className="note" style={{ margin: 0 }}>Lesson not loaded.</p>
+              )}
+            </div>
             <div className="panel">
               <h2>Trades <span>you place every trade</span></h2>
               <div className="kv">

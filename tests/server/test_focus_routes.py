@@ -135,3 +135,20 @@ def test_job_queue_draft_and_submit(client):
 def test_job_link_must_be_http(client):
     r = client.post("/v1/focus/jobs", json={"title": "T", "url": "javascript:alert(1)"})
     assert r.status_code == 422
+
+
+def test_spanish_lesson_flow(client):
+    first = client.get("/v1/focus/spanish").json()
+    assert first["card"]["kind"] == "intro"
+    assert first["progress"]["unit"] == "Greetings"
+    item = first["card"]["item_id"]
+    out = client.post(
+        "/v1/focus/spanish/answer", json={"item_id": item, "action": "skip_unit"}
+    ).json()
+    assert out["progress"]["unit"] == "Numbers 1 to 10"
+    assert client.get("/v1/focus/spanish").json()["progress"]["words_mastered"] == 12
+    assert "sections" not in client.get("/v1/focus/state").json()
+    bad = client.post(
+        "/v1/focus/spanish/answer", json={"item_id": "nope:1", "action": "seen"}
+    )
+    assert bad.status_code == 400

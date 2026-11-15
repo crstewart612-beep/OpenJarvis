@@ -13,6 +13,7 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Request, Response
 from pydantic import BaseModel, Field
 
+from openjarvis.focus import spanish
 from openjarvis.focus.signals import (
     CONTRACTS,
     max_stop_points,
@@ -30,6 +31,7 @@ focus_router = APIRouter(prefix="/v1/focus", tags=["focus"])
 VOICE_MODES = {
     "calm": ("bm_george", 0.88),
     "deadline": ("am_eric", 1.1),
+    "es": ("em_alex", 0.85),
 }
 
 _BREAKDOWN_PROMPT = (
@@ -78,6 +80,12 @@ class JobBody(BaseModel):
 
 class JobStatusBody(BaseModel):
     status: str = Field(pattern=r"^(found|drafted|submitted|skipped)$")
+
+
+class SpanishAnswerBody(BaseModel):
+    item_id: str = Field(min_length=1, max_length=60)
+    action: str = Field(pattern=r"^(seen|answer|skip|skip_unit)$")
+    text: str = Field(default="", max_length=200)
 
 
 class SpeakBody(BaseModel):
@@ -268,6 +276,31 @@ async def set_job_status(request: Request, job_id: str, body: JobStatusBody):
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+def _spanish_state(request: Request) -> dict:
+    return _store(request).section("spanish") or spanish.new_state()
+
+
+@focus_router.get("/spanish")
+async def spanish_lesson(request: Request):
+    state = _spanish_state(request)
+    return {"card": spanish.next_card(state), "progress": spanish.progress(state)}
+
+
+@focus_router.post("/spanish/answer")
+async def spanish_answer(request: Request, body: SpanishAnswerBody):
+    state = _spanish_state(request)
+    try:
+        result = spanish.answer(state, body.item_id, body.action, body.text)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    _store(request).save_section("spanish", state)
+    return {
+        "result": result,
+        "card": spanish.next_card(state),
+        "progress": spanish.progress(state),
+    }
 
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost", "testclient"}
