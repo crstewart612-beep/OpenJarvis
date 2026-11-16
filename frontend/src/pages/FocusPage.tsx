@@ -45,7 +45,7 @@ interface MailState { loading?: boolean; available: boolean; unread: number; acc
 interface SizingRow { symbol: string; point_value: number; max_stop_points: number }
 
 // Shown in the top bar so a screenshot tells which version is running.
-const BUILD = 'build 26';
+const BUILD = 'build 27';
 // What the assistant is called on screen and out loud.
 const NAME = 'Morpheus';
 const NAV: [string, string][] = [

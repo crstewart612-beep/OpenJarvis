@@ -23,20 +23,25 @@ function run(argv) {
   let total = 0;
   const latest = [];
   mail.accounts().forEach(acct => {
-    let unread = 0;
-    acct.mailboxes().forEach(box => {
-      const name = box.name().toLowerCase();
-      if (name !== 'inbox') return;
-      unread += box.unreadCount();
-      if (latest.length >= limit) return;
-      const found = box.messages.whose({readStatus: false})();
-      found.slice(0, limit - latest.length).forEach(m => latest.push({
-        from: m.sender(), subject: m.subject(),
-        date: m.dateReceived().toISOString(), account: acct.name(),
-      }));
-    });
-    total += unread;
-    accounts.push({name: acct.name(), unread: unread});
+    // An account that is offline or half set up must not sink the others.
+    try {
+      const label = acct.name();
+      let unread = 0;
+      acct.mailboxes().forEach(box => {
+        try {
+          if (box.name().toLowerCase() !== 'inbox') return;
+          unread += box.unreadCount();
+          if (latest.length >= limit) return;
+          const found = box.messages.whose({readStatus: false})();
+          found.slice(0, limit - latest.length).forEach(m => latest.push({
+            from: m.sender(), subject: m.subject(),
+            date: m.dateReceived().toISOString(), account: label,
+          }));
+        } catch (err) {}
+      });
+      total += unread;
+      accounts.push({name: label, unread: unread});
+    } catch (err) {}
   });
   return JSON.stringify({unread: total, accounts: accounts, latest: latest});
 }

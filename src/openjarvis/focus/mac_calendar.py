@@ -32,13 +32,19 @@ function run(argv) {
   const end = new Date(argv[1]);
   const out = [];
   cal.calendars().forEach(c => {
-    const found = c.events.whose({_and: [
-      {startDate: {_greaterThan: start}}, {startDate: {_lessThan: end}},
-    ]})();
-    found.forEach(e => out.push({
-      title: e.summary(), start: e.startDate().toISOString(),
-      all_day: e.alldayEvent(), calendar: c.name(),
-    }));
+    // One slow or odd calendar must not sink the rest; the big generated
+    // ones (birthdays, holidays) are skipped because they take minutes.
+    try {
+      const name = c.name();
+      if (/birthday|holiday|siri/i.test(name)) return;
+      const found = c.events.whose({_and: [
+        {startDate: {_greaterThan: start}}, {startDate: {_lessThan: end}},
+      ]})();
+      found.forEach(e => out.push({
+        title: e.summary(), start: e.startDate().toISOString(),
+        all_day: e.alldayEvent(), calendar: name,
+      }));
+    } catch (err) {}
   });
   return JSON.stringify(out);
 }
@@ -77,17 +83,24 @@ def _osascript(script: str, *args: str, timeout: float = 30.0) -> str:
             timeout=timeout,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise CalendarError("The Calendar app did not answer.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise CalendarError(
+            "The Calendar app did not answer in time. Giving Terminal Full Disk "
+            "Access lets it be read directly, which is much faster."
+        ) from exc
+    except OSError as exc:
+        raise CalendarError("This computer cannot run the Calendar helper.") from exc
     if done.returncode != 0:
-        detail = (done.stderr or "").strip()
-        if "-1743" in detail or "not allowed" in detail.lower():
+        detail = " ".join((done.stderr or "").split())
+        low = detail.lower()
+        if "-1743" in detail or "not allowed" in low or "not authorized" in low:
             raise CalendarError(
                 "macOS has not allowed access to Calendar yet. Open System Settings, "
                 "Privacy & Security, Automation, and switch Calendar on for Terminal."
             )
         logger.warning("osascript failed: %s", detail[:300])
-        raise CalendarError("The Calendar app returned an error.")
+        # Include the system's own words so a screenshot shows the cause.
+        raise CalendarError(f"The Calendar app returned an error: {detail[:160]}")
     return done.stdout.strip()
 
 

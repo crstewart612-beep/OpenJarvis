@@ -70,3 +70,25 @@ def test_permission_error_is_explained(monkeypatch):
     monkeypatch.setattr(mac_calendar.subprocess, "run", lambda *a, **k: Done())
     with pytest.raises(mac_calendar.CalendarError, match="Automation"):
         mac_calendar.calendars()
+
+
+def test_other_errors_carry_the_system_message(monkeypatch):
+    class Done:
+        returncode = 1
+        stdout = ""
+        stderr = "execution error: Error: Error: Can't get object. (-1728)\n"
+
+    monkeypatch.setattr(mac_calendar.subprocess, "run", lambda *a, **k: Done())
+    with pytest.raises(mac_calendar.CalendarError, match="-1728"):
+        mac_calendar.calendars()
+
+
+def test_not_authorized_wording_is_a_permission_error(monkeypatch):
+    class Done:
+        returncode = 1
+        stdout = ""
+        stderr = "Error: Error: Not authorized to send Apple events to Mail."
+
+    monkeypatch.setattr(mac_calendar.subprocess, "run", lambda *a, **k: Done())
+    with pytest.raises(mac_calendar.CalendarError, match="Automation"):
+        mac_calendar.calendars()
